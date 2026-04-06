@@ -1,12 +1,13 @@
-# KIUB - KiCad Ultiboard Import Tool
+# Ultiboard DDF to KiCad Converter (KIUB)
 
-<ins>ULTIboard and ULTIcap are registered trademarks of</ins>\
-Ultimate Technologies\
-Electronics Workbench (EWB)\
-National Instruments (NI)
+><ins>**Legal Notice**</ins>\
+KIUB is a functional acronym for <ins>**Ki**</ins>Cad <ins>**U**</ins>lti<ins>**B**</ins>oard Converter.\
+This is an independent, open-source project and is not affiliated with, sponsored by, or endorsed by any companies sharing a similar name.\
+Ultiboard is a registered trademark of National Instruments (formerly Ultimate Technology / Electronics Workbench).\
+KiCad is a free software suite for electronic design automation.\
+This tool is provided "as-is" for file migration purposes only.
 
-
-**KIUB** is a high-fidelity converter designed to migrate legacy **Ultiboard DDF** (Design Description Format) files into modern **KiCad PCB** (`.kicad_pcb`) projects. 
+This is a high-fidelity converter designed to migrate legacy **Ultiboard DDF** (`.ddf`) files into modern **KiCad PCB** (`.kicad_pcb`) projects. 
 
 ---
 
