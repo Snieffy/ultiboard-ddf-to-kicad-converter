@@ -17,9 +17,8 @@
 """
 KIUB: A modern Python-based converter for Ultiboard DDF to KiCad PCB.
 Based on: Ultiboard 32bit DOS and Windows95 - Reference Manual - Appendix A (1997).
-Version: 1.0.0
+Version: 1.1.0
 """
-
 from __future__ import annotations
 
 import sys
@@ -398,6 +397,18 @@ class Converter:
             return round((val / 1.2) * 0.0254, accuracy)   # 1/1200 inch
         return round(val / 1_000_000, accuracy)             # nanometres
 
+    def _f(self, val: float) -> str:
+        """Round val to di_Ac decimal places and return as a string.
+
+        Every coordinate or dimension that is written into KiCad output must
+        pass through this method.  Adding two individually-rounded floats can
+        produce IEEE 754 representation noise beyond di_Ac digits (e.g.
+        units_to_mm(x) + offsetX may yield 2193.9023770000003 instead of 2193.902377).
+        A final round here eliminates that artefact before the value is
+        serialised as text.
+        """
+        return str(round(val, self.di_Ac))
+
     @staticmethod
     def _map_ddf_to_kicad_net(netnr: int) -> int:
         """Translate DDF net number to KiCad net number (65535 → 0)."""
@@ -506,10 +517,10 @@ class Converter:
             if int(net) != 65535
         ]
         self.zoneParams["pwrPlanes"] = pwrPlanes
-        self.zoneParams["extX0"]     = self.units_to_mm(board_params[0]) + self.offsetX
-        self.zoneParams["extY0"]     = -self.units_to_mm(board_params[1]) + self.offsetY
-        self.zoneParams["extX1"]     = self.units_to_mm(board_params[2]) + self.offsetX
-        self.zoneParams["extY1"]     = -self.units_to_mm(board_params[3]) + self.offsetY
+        self.zoneParams["extX0"]     = round(self.units_to_mm(board_params[0]) + self.offsetX, self.di_Ac)
+        self.zoneParams["extY0"]     = round(-self.units_to_mm(board_params[1]) + self.offsetY, self.di_Ac)
+        self.zoneParams["extX1"]     = round(self.units_to_mm(board_params[2]) + self.offsetX, self.di_Ac)
+        self.zoneParams["extY1"]     = round(-self.units_to_mm(board_params[3]) + self.offsetY, self.di_Ac)
 
     # -----------------------------------------------------------------------
     # *S – Shape definition
@@ -548,14 +559,14 @@ class Converter:
             f'     (at {{shapePos}})\n'
             f'     {{r_block}}{{v_block}}'
             f'     (fp_text user "${sName}"\n'
-            f'        (at {sn_rel_x} {sn_rel_y} {sn_rot})\n'
+            f'        (at {self._f(sn_rel_x)} {self._f(sn_rel_y)} {self._f(sn_rot)})\n'
             f'        (unlocked yes)\n'
             f'        (layer "{{fp_side}}.Fab")\n'
             f'        (effects\n'
             f'           (font\n'
             f'              (face "{self.args.font}")\n'
-            f'              (size {sn_height} {sn_width})\n'
-            f'              (thickness {sn_thick})\n'
+            f'              (size {self._f(sn_height)} {self._f(sn_width)})\n'
+            f'              (thickness {self._f(sn_thick)})\n'
             f'           )\n{{mir}}'
             f'        )\n'
             f'     )\n'
@@ -609,10 +620,10 @@ class Converter:
         for p in range(0, len(seg_coords) - 3, 4):
             seg = (
                 f'     ({li_type}\n'
-                f'        (start {self.units_to_mm(seg_coords[p])     + ox}'
-                f' {-self.units_to_mm(seg_coords[p + 1]) + oy})\n'
-                f'        (end   {self.units_to_mm(seg_coords[p + 2]) + ox}'
-                f' {-self.units_to_mm(seg_coords[p + 3]) + oy})\n'
+                f'        (start {self._f(self.units_to_mm(seg_coords[p])     + ox)}'
+                f' {self._f(-self.units_to_mm(seg_coords[p + 1]) + oy)})\n'
+                f'        (end   {self._f(self.units_to_mm(seg_coords[p + 2]) + ox)}'
+                f' {self._f(-self.units_to_mm(seg_coords[p + 3]) + oy)})\n'
                 f'        (width {self.lineWidth})\n'
                 f'        (layer "{fp_layer}")\n'
                 f'     )\n'
@@ -671,8 +682,8 @@ class Converter:
                     fp_layer = "Edge.Cuts" if is_board else "{fp_side}.SilkS"
                     shape_t  = (
                         f'     ({li_type}\n'
-                        f'        (center {centre_x + ox} {-centre_y + oy})\n'
-                        f'        (end {centre_x + radius + ox} {-centre_y + oy})\n'
+                        f'        (center {self._f(centre_x + ox)} {self._f(-centre_y + oy)})\n'
+                        f'        (end {self._f(centre_x + radius + ox)} {self._f(-centre_y + oy)})\n'
                         f'        (width {self.lineWidth})\n'
                         f'        (layer "{fp_layer}")\n'
                         f'     )\n'
@@ -686,12 +697,12 @@ class Converter:
                         radius, start_angle, span_angle, self.di_Ac)
                     shape_t = (
                         f'     ({li_type}\n'
-                        f'        (start {round(centre_x + dx_start, self.di_Ac) + ox}'
-                        f' {-round(centre_y + dy_start, self.di_Ac) + oy})\n'
-                        f'        (mid   {round(centre_x + dx_mid,   self.di_Ac) + ox}'
-                        f' {-round(centre_y - dy_mid,   self.di_Ac) + oy})\n'
-                        f'        (end   {round(centre_x + dx_end,   self.di_Ac) + ox}'
-                        f' {-round(centre_y + dy_end,   self.di_Ac) + oy})\n'
+                        f'        (start {self._f(centre_x + dx_start + ox)}'
+                        f' {self._f(-centre_y - dy_start + oy)})\n'
+                        f'        (mid   {self._f(centre_x + dx_mid   + ox)}'
+                        f' {self._f(-centre_y + dy_mid   + oy)})\n'
+                        f'        (end   {self._f(centre_x + dx_end   + ox)}'
+                        f' {self._f(-centre_y - dy_end   + oy)})\n'
                         f'        (width {self.lineWidth})\n'
                         f'        (layer "{fp_layer}")\n'
                         f'     )\n'
@@ -812,23 +823,23 @@ class Converter:
         cshape = carr[2]
 
         carr   = self._readline().split(",")
-        cxpos  = self.units_to_mm(int(carr[0])) + self.offsetX
-        cypos  = -self.units_to_mm(int(carr[1])) + self.offsetY
+        cxpos  = round(self.units_to_mm(int(carr[0])) + self.offsetX, self.di_Ac)
+        cypos  = round(-self.units_to_mm(int(carr[1])) + self.offsetY, self.di_Ac)
         layerB = int(carr[2]) / 64 < 0
-        crot   = int(carr[2]) / 64
+        crot   = round(int(carr[2]) / 64, self.di_Ac)
 
-        cnxpos = (-self.units_to_mm(int(carr[3])) if layerB else self.units_to_mm(int(carr[3])))
-        cnypos = -self.units_to_mm(int(carr[4]))
-        cnrot  = int(carr[5]) / 64 + crot
-        cnhght = self.units_to_mm(int(carr[6]))
-        cnwdth = self.units_to_mm(int(carr[7]))
+        cnxpos = round(-self.units_to_mm(int(carr[3])) if layerB else self.units_to_mm(int(carr[3])), self.di_Ac)
+        cnypos = round(-self.units_to_mm(int(carr[4])), self.di_Ac)
+        cnrot  = round(int(carr[5]) / 64 + crot, self.di_Ac)
+        cnhght = round(self.units_to_mm(int(carr[6])), self.di_Ac)
+        cnwdth = round(self.units_to_mm(int(carr[7])),  self.di_Ac)
         cnthck = round(int(carr[8]) * cnhght / self.fontThickRatio, self.di_Ac)
 
-        caxpos = (-self.units_to_mm(int(carr[9])) if layerB else self.units_to_mm(int(carr[9])))
-        caypos = -self.units_to_mm(int(carr[10]))
-        carot  = int(carr[11]) / 64 + crot
-        cahght = self.units_to_mm(int(carr[12]))
-        cawdth = self.units_to_mm(int(carr[13]))
+        caxpos = round(-self.units_to_mm(int(carr[9])) if layerB else self.units_to_mm(int(carr[9])), self.di_Ac)
+        caypos = round(-self.units_to_mm(int(carr[10])), self.di_Ac)
+        carot  = round(int(carr[11]) / 64 + crot, self.di_Ac)
+        cahght = round(self.units_to_mm(int(carr[12])), self.di_Ac)
+        cawdth = round(self.units_to_mm(int(carr[13])),  self.di_Ac)
         cathck = round(int(carr[14]) * cahght / self.fontThickRatio, self.di_Ac)
 
         self.ddf.readline()  # thermal/force vector line – not used
@@ -965,7 +976,8 @@ class Converter:
         pad_x      = -pad['relx'] if layerB else pad['relx']
 
         if padshape == "thru_hole roundrect":
-            pad_w = pad_h = drCode + 0.01
+            # drCode is a float from units_to_mm; adding 0.01 can produce IEEE noise.
+            pad_w = pad_h = round(drCode + 0.01, self.di_Ac)
             pad_offset    = 0
             pad_rr        = 0.5
         else:
@@ -978,10 +990,10 @@ class Converter:
 
         return (
             f'     (pad "{pad["name"]}" {padshape}\n'
-            f'           (at {pad_x} {pad["rely"]} {pad["rot"] + crot})\n'
-            f'           (size {pad_w} {pad_h})\n'
+            f'           (at {self._f(pad_x)} {self._f(pad["rely"])} {self._f(pad["rot"] + crot)})\n'
+            f'           (size {self._f(pad_w)} {self._f(pad_h)})\n'
             f'           (drill {drCode}\n'
-            f'                   (offset {pad_offset} 0)\n'
+            f'                   (offset {self._f(pad_offset)} 0)\n'
             f'           )\n'
             f'           (layers{pinLayer})\n'
             f'           (roundrect_rratio {pad_rr})\n'
@@ -1022,25 +1034,25 @@ class Converter:
 
                 match orient:
                     case 1:     # horizontal
-                        x1, y1 = coord2 + self.offsetX, -coord1 + self.offsetY
-                        x2, y2 = coord3 + self.offsetX, -coord1 + self.offsetY
+                        x1, y1 = self._f(coord2 + self.offsetX), self._f(-coord1 + self.offsetY)
+                        x2, y2 = self._f(coord3 + self.offsetX), self._f(-coord1 + self.offsetY)
                     case 2:     # vertical
-                        x1, y1 = coord1 + self.offsetX, -coord2 + self.offsetY
-                        x2, y2 = coord1 + self.offsetX, -coord3 + self.offsetY
+                        x1, y1 = self._f(coord1 + self.offsetX), self._f(-coord2 + self.offsetY)
+                        x2, y2 = self._f(coord1 + self.offsetX), self._f(-coord3 + self.offsetY)
                     case 4:     # north-east diagonal
                         half1 = (coord1 - coord2) / 2
                         half2 = (coord1 - coord3) / 2
-                        x1 = round(coord2 + half1, self.di_Ac) + self.offsetX
-                        y1 = round(half1,           self.di_Ac) + self.offsetY
-                        x2 = round(coord3 + half2, self.di_Ac) + self.offsetX
-                        y2 = round(half2,           self.di_Ac) + self.offsetY
+                        x1 = self._f(round(coord2 + half1, self.di_Ac) + self.offsetX)
+                        y1 = self._f(round(half1,           self.di_Ac) + self.offsetY)
+                        x2 = self._f(round(coord3 + half2, self.di_Ac) + self.offsetX)
+                        y2 = self._f(round(half2,           self.di_Ac) + self.offsetY)
                     case 8:     # south-east diagonal
                         half1 = (coord2 - coord1) / 2
                         half2 = (coord3 - coord1) / 2
-                        x1 = round(coord2 - half1, self.di_Ac) + self.offsetX
-                        y1 = round(half1,           self.di_Ac) + self.offsetY
-                        x2 = round(coord3 - half2, self.di_Ac) + self.offsetX
-                        y2 = round(half2,           self.di_Ac) + self.offsetY
+                        x1 = self._f(round(coord2 - half1, self.di_Ac) + self.offsetX)
+                        y1 = self._f(round(half1,           self.di_Ac) + self.offsetY)
+                        x2 = self._f(round(coord3 - half2, self.di_Ac) + self.offsetX)
+                        y2 = self._f(round(half2,           self.di_Ac) + self.offsetY)
 
                 self.kicad.write(
                     f'  (segment\n'
@@ -1060,10 +1072,10 @@ class Converter:
         vlayer = layer_from_bit(vline[0] - 1)[1]
         self.kicad.write(
             f'  (segment\n'
-            f'        (start {self.units_to_mm(vline[1]) + self.offsetX}'
-            f' {-self.units_to_mm(vline[2]) + self.offsetY})\n'
-            f'        (end {self.units_to_mm(vline[3]) + self.offsetX}'
-            f' {-self.units_to_mm(vline[4]) + self.offsetY})\n'
+            f'        (start {self._f(self.units_to_mm(vline[1]) + self.offsetX)}'
+            f' {self._f(-self.units_to_mm(vline[2]) + self.offsetY)})\n'
+            f'        (end {self._f(self.units_to_mm(vline[3]) + self.offsetX)}'
+            f' {self._f(-self.units_to_mm(vline[4]) + self.offsetY)})\n'
             f'        (width {self.units_to_mm(self.traceWidth[vline[6]])})\n'
             f'        (layer "{vlayer}")\n'
             f'        (net {self._map_ddf_to_kicad_net(vline[5])})\n'
@@ -1093,12 +1105,12 @@ class Converter:
 
         self.kicad.write(
             f'  (gr_arc\n'
-            f'        (start {centre_x + dx_start + self.offsetX}'
-            f' {-(centre_y + dy_start) + self.offsetY})\n'
-            f'        (mid   {centre_x + dx_mid   + self.offsetX}'
-            f' {-(centre_y - dy_mid)   + self.offsetY})\n'
-            f'        (end   {centre_x + dx_end   + self.offsetX}'
-            f' {-(centre_y + dy_end)   + self.offsetY})\n'
+            f'        (start {self._f(centre_x + dx_start + self.offsetX)}'
+            f' {self._f(-(centre_y + dy_start) + self.offsetY)})\n'
+            f'        (mid   {self._f(centre_x + dx_mid   + self.offsetX)}'
+            f' {self._f(-(centre_y - dy_mid)   + self.offsetY)})\n'
+            f'        (end   {self._f(centre_x + dx_end   + self.offsetX)}'
+            f' {self._f(-(centre_y + dy_end)   + self.offsetY)})\n'
             f'        (width {atWidth})\n'
             f'        (layer "{alayer}")\n'
             f'        (net {anetnr})\n'
@@ -1153,7 +1165,7 @@ class Converter:
             coords = [self.units_to_mm(int(i)) for i in poly_line.strip(':;').split()]
             for px, py in zip(coords[::2], coords[1::2]):
                 self.kicad.write(
-                    f'                (xy {px + self.offsetX} {-py + self.offsetY})\n')
+                    f'                (xy {self._f(px + self.offsetX)} {self._f(-py + self.offsetY)})\n')
             if ':' in poly_line or ';' in poly_line:
                 break
 
@@ -1164,14 +1176,14 @@ class Converter:
     # -----------------------------------------------------------------------
 
     def _handle_via(self, line: str) -> None:
-        vxpos = self.units_to_mm(int(line[3:].split()[0])) + self.offsetX
+        vxpos = self._f(self.units_to_mm(int(line[3:].split()[0])) + self.offsetX)
 
         while True:
             via_line = self._readline()
             if via_line[0] == ';':
                 break
             vf        = via_line.split()
-            vypos     = -self.units_to_mm(int(vf[0])) + self.offsetY
+            vypos     = self._f(-self.units_to_mm(int(vf[0])) + self.offsetY)
             vnetnr    = self._map_ddf_to_kicad_net(int(vf[1]))
             vpcode    = int(vf[2])
             mask_bits = bin(int(vf[3], 16) & int(self.layerMask, 16))[2:].zfill(32)[::-1]
@@ -1214,10 +1226,10 @@ class Converter:
 
     def _handle_text(self, line: str) -> None:
         xfields  = line[3:].split(None, 7)[:7]
-        text_x   = self.units_to_mm(int(xfields[0])) + self.offsetX
-        text_y   = -self.units_to_mm(int(xfields[1])) + self.offsetY
-        text_h   = self.units_to_mm(int(xfields[2])) / self.fontHeightRatio
-        text_w   = self.units_to_mm(int(xfields[3])) * self.fontWidthRatio
+        text_x   = round(self.units_to_mm(int(xfields[0])) + self.offsetX, self.di_Ac)
+        text_y   = round(-self.units_to_mm(int(xfields[1])) + self.offsetY, self.di_Ac)
+        text_h   = round(self.units_to_mm(int(xfields[2])) / self.fontHeightRatio, self.di_Ac)
+        text_w   = round(self.units_to_mm(int(xfields[3])) * self.fontWidthRatio,  self.di_Ac)
         text_t   = round(int(xfields[4]) * text_h / self.fontThickRatio, self.di_Ac)
         text_bot = int(xfields[5]) / 64 < 0
         text_rot = int(xfields[5]) / 64
