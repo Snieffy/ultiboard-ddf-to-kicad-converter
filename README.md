@@ -103,7 +103,7 @@ mimic the DDF design in Kicad, small differences still are possible.
   a rework of the S-expressions would be a great improvement.
 - Since some settings need to be stored in the .kicad_pro file, automatic
   creation of this file would also be a great addition.
-- And adding a GUI or making it a Kicad plugin would complete the project.
+- Making it a Kicad plugin would complete the project.
 
 Work in progress:
 - Creation of a font that exactly replicates Ultiboard characters
