@@ -40,6 +40,7 @@ Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calcul
 *   **Layer Intelligence:** Automatic mapping of Ultiboard stackups to KiCad's signal and technical layers.
 *   **Optional GUI:** Easy file, folder and font selection.
 
+![Ultiboard to KiCad conversion example using KIUB](assets/ultiboard-to-kicad-conversion-example.png)
 ---
 
 ## Usage
