@@ -32,15 +32,16 @@ Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calcul
 
 ## Key Features
 
-*   **Modern KiCad Support:** Generates native S-expression based `.kicad_pcb` files.
+*   **Modern KiCad Support:** Generates native S-expression based `.kicad_pcb` files and Json based `.kicad_pro` files.
 *   **DDF Support:** Handles both V4.x (database units) and V5.x (nanometer) files.
 *   **Advanced Geometry:** Precision handling of tracks, vias, pads (SMD & THT), and complex copper zones.
 *   **Unicode Text Support:** Accurately converts Ultiboard internal fonts to KiCad-compatible text strings.
 *   **Zero Dependencies:** A lightweight implementation using standard Python libraries.
 *   **Layer Intelligence:** Automatic mapping of Ultiboard stackups to KiCad's signal and technical layers.
-*   **Optional GUI:** Easy file, folder and font selection.
+*   **Optional GUI:** Easy file, folder and font selection (Tkinter package needed).
 
 ![Ultiboard to KiCad conversion example using KIUB](assets/ultiboard-to-kicad-conversion-example.png)
+
 ---
 
 ## Usage
@@ -58,15 +59,6 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > [!NOTE]
 > When no file extension is specified, the code will add .DDF to the source file and/or .kicad_pcb to the destination file.
 
-> [!TIP]
-> The optional GUI allows you to easily convert DDF files.\
-> Make sure both files, KIUB.py and KIUB_gui.py, are in the same directory.\
-> **Features:**
-> - Easy file selection with automatic extension name creation.
-> - Different path for the output file.
-> - Font selection.
-> - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
-
 ### Examples
 
 | Command | Description |
@@ -78,6 +70,18 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 
 > [!NOTE]
 > The DDF folder contains sample DDF files to demonstrate the conversion capabilities.
+
+> [!TIP]
+> The optional GUI allows you to easily convert DDF files.\
+> Make sure both files, KIUB.py and KIUB_gui.py, are in the same directory.\
+> **Features:**
+> - Easy file selection with automatic extension name creation.
+> - Different path for the output file.
+> - Font selection.
+> - Open in KiCAD button (user selectable Kicad PCB executable path).
+> - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
+
+![Ultiboard to KiCad GUI](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI.png)
 
 ---
 
@@ -93,17 +97,13 @@ As this project is GPLv3, all derivatives must remain open and free.
 ### Introduction
 ```
 The software has been thouroughly tested with many different PCB designs.
-Except the need for disabling Kicad warnings mentioned in the 'Tips' section,
-no other errors occured. Even though great care has been taken to accurately
-mimic the DDF design in Kicad, small differences still are possible.
+Even though great care has been taken to accurately mimic the
+DDF design in Kicad, small differences still are possible.
 
 - KIUB currently creates PCB files readable by KiCad V9.
   While the design data is accurate, KiCad will perform a one-time update
   of the S-expression notation when the file is first opened.
-- Although this does not affect the PCB design data,
-  a rework of the S-expressions would be a great improvement.
-- Since some settings need to be stored in the .kicad_pro file, automatic
-  creation of this file would also be a great addition.
+- Automatic creation of a .kicad_pro file with settings obtained from the DDF file.
 - Making it a Kicad plugin would complete the project.
 
 Work in progress:
@@ -155,13 +155,12 @@ Erratum DDF file structure
                         |              "        |
                        (R)-------------+--------+
           Although correctly read, Kicad's 3D view will tell the board outline is malformed.
-          Either remove the single line (not the cutout) or move it to a User layer.
-          If the board outline still does not show in 3D view,
-          then the board outline probably isn't a closed polygon.
-          -> In Kicad, select all lines on the Edge Cuts layer, right click on any part and
-          select 'Shape modification' - 'Heal shapes' to close the polygon.
-          *** Rule of thumb:
-          Intersecting lines within the board outline should be erased or moved to a User layer.
+          To fix this, the program moves any floating lines to the F.Fab layer.
+          Due to rounding errors in Ultiboard, the board outline sometimes isn't a closed
+          polygon. The program tries to snap all line endpoints together within a predefined
+          tolerance of 0.1mm (set by snapTolerance).
+          If the board outline still is malformed in 3D view, select all lines on the Edge Cuts layer,
+          right click on any part and select 'Shape modification' - 'Heal shapes' to close the polygon.
         - All coordinates in the DDF file have their origin (0,0) at the Board origin (X).
           In Ultiboard, the Board origin and reference point can be changed.
           The default board origin is the board center position.
@@ -225,48 +224,37 @@ Erratum DDF file structure
       Ultiboard           ->  Kicad layers
       pad and via layerset
       Top     00000001h       (0 "F.Cu" signal)
-      Bottom  00000002h       (2 "B.Cu" signal)
-      1       00000008h       (4 "In1.Cu" signal)
-      2       00000004h       (6 "In2.Cu" signal)
-      3       00000020h       (8 "In3.Cu" signal)
-      4       00000010h       (10 "In4.Cu" signal)
-      5       00000080h       (12 "In5.Cu" signal)
-      6       00000040h       (14 "In6.Cu" signal)
-      7       00000200h       (16 "In7.Cu" signal)
-      8       00000100h       (18 "In8.Cu" signal)
-      9       00000800h       (20 "In9.Cu" signal)
-      10      00000400h       (22 "In10.Cu" signal)
-      11      00002000h       (24 "In11.Cu" signal)
-      12      00001000h       (26 "In12.Cu" signal)
-      13      00008000h       (28 "In13.Cu" signal)
-      14      00004000h       (30 "In14.Cu" signal)
-      15      00020000h       (32 "In15.Cu" signal)
-      16      00010000h       (34 "In16.Cu" signal)
-      17      00080000h       (36 "In17.Cu" signal)
-      18      00040000h       (38 "In18.Cu" signal)
-      19      00200000h       (40 "In19.Cu" signal)
-      20      00100000h       (42 "In20.Cu" signal)
-      21      00800000h       (44 "In21.Cu" signal)
-      22      00400000h       (46 "In22.Cu" signal)
-      23      02000000h       (48 "In23.Cu" signal)
-      24      01000000h       (50 "In24.Cu" signal)
-      25      08000000h       (52 "In25.Cu" signal)
-      26      04000000h       (54 "In26.Cu" signal)
-      27      20000000h       (56 "In27.Cu" signal)
-      28      10000000h       (58 "In28.Cu" signal)
-      29      80000000h       (60 "In29.Cu" signal)
-      30      40000000h       (62 "In30.Cu" signal)
-```
-### Kicad manual Settings
-```
-Some parameters need to be changed by the user in order to prevent DRC errors.
-- In 'Board Setup' - 'Constrains' and 'Solder Mask/Paste'.
-    Change the appropriate values to match those used in Ultiboard
-    and/or those used by the PCB manufaturor.
-    e.g.:
-     (design class 4)
-     in 'Solder Mask/Paste', set 'Solder mask minimum web width' to 0.15mm.
-     in 'Constrains', set hole clearances to 0.2mm and copper to edge clearance to 0.25mm.
+      Bottom  00000002h       (31 "B.Cu" signal)
+      1       00000008h       (1 "In1.Cu" signal)
+      2       00000004h       (2 "In2.Cu" signal)
+      3       00000020h       (3 "In3.Cu" signal)
+      4       00000010h       (4 "In4.Cu" signal)
+      5       00000080h       (5 "In5.Cu" signal)
+      6       00000040h       (6 "In6.Cu" signal)
+      7       00000200h       (7 "In7.Cu" signal)
+      8       00000100h       (8 "In8.Cu" signal)
+      9       00000800h       (9 "In9.Cu" signal)
+      10      00000400h       (10 "In10.Cu" signal)
+      11      00002000h       (11 "In11.Cu" signal)
+      12      00001000h       (12 "In12.Cu" signal)
+      13      00008000h       (13 "In13.Cu" signal)
+      14      00004000h       (14 "In14.Cu" signal)
+      15      00020000h       (15 "In15.Cu" signal)
+      16      00010000h       (16 "In16.Cu" signal)
+      17      00080000h       (17 "In17.Cu" signal)
+      18      00040000h       (18 "In18.Cu" signal)
+      19      00200000h       (19 "In19.Cu" signal)
+      20      00100000h       (20 "In20.Cu" signal)
+      21      00800000h       (21 "In21.Cu" signal)
+      22      00400000h       (22 "In22.Cu" signal)
+      23      02000000h       (23 "In23.Cu" signal)
+      24      01000000h       (24 "In24.Cu" signal)
+      25      08000000h       (25 "In25.Cu" signal)
+      26      04000000h       (26 "In26.Cu" signal)
+      27      20000000h       (27 "In27.Cu" signal)
+      28      10000000h       (28 "In28.Cu" signal)
+      29      80000000h       (29 "In29.Cu" signal)
+      30      40000000h       (30 "In30.Cu" signal)
 ```
 ### Features and limitations
 ```
@@ -292,10 +280,6 @@ Some parameters need to be changed by the user in order to prevent DRC errors.
              solid, +++ and XXX
              All other hatch patterns are set to solid fill.
 - Power planes are read and converted to solid zones (polygons).
-- 'boardClearance' variable:
-  Board edge clearance is read but needs to be manually set in Kicad (stored in .kicad_pro file)
-    -> In Kicad, use this value in 'Copper to edge clearance' in 
-       'File' - 'Board Setup' / 'Design Rules' - 'Constraints'
 - Pads  - pads with zero clearance will use the default clearance NPTHclearance.
         - A DDF can contain drillcodes without corresponding padcodes (NPTH).
           Since Kicad expects the pad size to be at least equal to the drill size,
@@ -311,9 +295,7 @@ Some parameters need to be changed by the user in order to prevent DRC errors.
           -> the through hole pad size is set to the drill diameter + 0.01mm.
           *** This construct causes Kicad to issue a warning upon running a DRC:
               Padstack is questionable (SMD pad has no outer layer)
-              This warning can be disabled in 'File - Board Setup' and in
-              'Design Rules' - 'Violation Severity' - 'Miscellaneous'
-              set 'Padstack is questionable' to 'Ignore'.
+              This warning is disabled in the '.kicad_pro' file.
           *** Another issue (apparently a known bug in Kicad): 
               Kicad PCB view will NOT display Inner layer pads if one of the Inner layers is padless.
               However, the 3D view WILL show the Inner layer pads correctly.
@@ -333,25 +315,7 @@ Some parameters need to be changed by the user in order to prevent DRC errors.
         These are converted to round vias using following settings:
         - Annular rings on start, end and connected layers.
         - Via Pad sizes for each layer (F.Cu, B.Cu In*.Cu),
-	  as defined in the DDF (Top, Bottom and Inner)
+	      as defined in the DDF (Top, Bottom and Inner)
 
 ```
-### Tips
-```
-- Prevent DRC solder mask overlap error messages in Kicad:
-        Open 'File - Board Setup'
-        In 'Board Stackup' - 'Solder mask/paste'
-        enable 'Allow bridged solder mask apertures between pads within footprints'.
-- Limit the number of warnings to those that really matter:
-        Open 'File - Board Setup'
-            - In 'Design Rules' - 'Violation Severity' - 'Miscellaneous'
-              set following items to 'Ignore':
-                'Footprint component type doesn't match footprint pads'
-                'Footprint not found in libraries'
-                'Footprint doesn't match copy in library'
-                'Padstack is questionable'
-            - In 'Violation Severity' - 'Readability',
-              following items can also be set to 'Ignore':
-                'Silkscreen overlap'
-                'Silkscreen clipped by solder mask'
-                'Silkscreen clipped by board edge'
+
