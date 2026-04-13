@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import importlib.util
 import io
 import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -95,6 +97,52 @@ class _QueueWriter(io.TextIOBase):
 
 
 # ---------------------------------------------------------------------------
+# KiCad executable config  (stored next to this script as kiub_gui.ini)
+# ---------------------------------------------------------------------------
+
+_CONFIG_FILE = Path(__file__).parent / "kiub_gui.ini"
+_CONFIG_SECTION = "kicad"
+_CONFIG_KEY     = "executable"
+
+
+def _load_kicad_exe() -> str:
+    """Return the stored KiCad executable path, or '' if not set / invalid."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    path = cfg.get(_CONFIG_SECTION, _CONFIG_KEY, fallback="").strip()
+    return path if path and Path(path).is_file() else ""
+
+
+def _save_kicad_exe(path: str) -> None:
+    """Persist the KiCad executable path to the config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    if not cfg.has_section(_CONFIG_SECTION):
+        cfg.add_section(_CONFIG_SECTION)
+    cfg.set(_CONFIG_SECTION, _CONFIG_KEY, path)
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+def _browse_kicad_exe(parent: tk.Misc | None = None) -> str:
+    """
+    Open a file-browser so the user can locate the KiCad executable.
+    Returns the chosen path string, or '' if the dialog was cancelled.
+    """
+    if sys.platform.startswith("win"):
+        filetypes = [("Executable", "*.exe"), ("All files", "*.*")]
+    else:
+        filetypes = [("All files", "*")]
+
+    path = filedialog.askopenfilename(
+        parent=parent,
+        title="Locate the KiCad PCB executable (pcbnew or pcbnew.exe)",
+        filetypes=filetypes,
+    )
+    return str(Path(path)) if path else ""
+
+
+# ---------------------------------------------------------------------------
 # Font helpers
 # ---------------------------------------------------------------------------
 
@@ -153,8 +201,12 @@ class KiubApp(tk.Tk):
         self._infile_var:   tk.StringVar     = tk.StringVar()
         self._outfile_var:  tk.StringVar     = tk.StringVar()
         self._font_var:     tk.StringVar     = tk.StringVar(value=self._DEFAULT_FONT)
-        self._verbose_var:  tk.BooleanVar    = tk.BooleanVar(value=False)
-        self._mono_var:     tk.BooleanVar    = tk.BooleanVar(value=False)
+        self._verbose_var:  tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
+        self._mono_var:     tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
+
+        # KiCad launcher state
+        self._kicad_exe:    str = _load_kicad_exe()   # '' until confirmed valid
+        self._last_pcb_path: str = ""                 # set after successful conversion
 
         # Font list is built once after the Tk root exists (tkfont.families()
         # requires a live Tk instance).
@@ -163,6 +215,11 @@ class KiubApp(tk.Tk):
 
         self._build_ui()
         self._load_fonts()          # populate combobox after window is ready
+
+        # If no valid KiCad path is stored, ask the user now (non-blocking:
+        # we do it after mainloop starts via after() so the window is visible).
+        if not self._kicad_exe:
+            self.after(200, self._ask_kicad_exe)
 
         # Start the polling loop once; it keeps rescheduling itself forever.
         self.after(self._POLL_INTERVAL_MS, self._poll_log)
@@ -292,6 +349,7 @@ class KiubApp(tk.Tk):
         ).grid(row=4, column=2, sticky=tk.W, padx=(6, 0), pady=(0, 8))
 
         # ── Action buttons ───────────────────────────────────────────────────
+        # Layout (left → right): ▶ Start Conversion | Open in KiCad | Clear Log | ⚙ KiCad Path…
         btn_frame = ttk.Frame(outer)
         btn_frame.grid(row=5, column=0, columnspan=3, pady=(0, 8))
 
@@ -300,8 +358,17 @@ class KiubApp(tk.Tk):
             command=self._start_conversion, width=22)
         self._start_btn.pack(side=tk.LEFT, padx=(0, 10))
 
+        self._open_btn = ttk.Button(
+            btn_frame, text="⎋  Open in KiCad",
+            command=self._open_in_kicad, width=18,
+            state=tk.DISABLED)          # enabled only after a successful conversion
+        self._open_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         ttk.Button(btn_frame, text="Clear Log",
-                   command=self._clear_log, width=12).pack(side=tk.LEFT)
+                   command=self._clear_log, width=12).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(btn_frame, text="⚙  KiCad Path…",
+                   command=self._change_kicad_exe, width=16).pack(side=tk.LEFT)
 
         # ── Log area ─────────────────────────────────────────────────────────
         ttk.Label(outer, text="Conversion log:", font=self._LABEL_FONT).grid(
@@ -342,12 +409,12 @@ class KiubApp(tk.Tk):
             filetypes=[("Ultiboard DDF", "*.ddf *.DDF"), ("All files", "*.*")],
         )
         if path:
-            self._infile_var.set(path)
+            self._infile_var.set(str(Path(path)))   # normalise to OS separators
 
     def _browse_outdir(self) -> None:
         directory = filedialog.askdirectory(title="Select output folder")
         if directory:
-            self._out_dir_var.set(directory)
+            self._out_dir_var.set(str(Path(directory)))   # normalise to OS separators
 
     # -----------------------------------------------------------------------
     # Automatic output path derivation
@@ -425,31 +492,45 @@ class KiubApp(tk.Tk):
     def _run_conversion(self, args: argparse.Namespace) -> None:
         """
         Run Converter in a worker thread, capturing all stdout into the log.
-        Also write to <input_filename>_log.txt 
-        On completion (success or failure) a sentinel string is placed on the
-        queue so the main thread can re-enable the UI.
+        Also writes to <input_stem>_log.txt including the header lines shown
+        in the GUI log window.
+        On completion a sentinel string is placed on the queue so the main
+        thread can re-enable the UI.
         """
-        input_path = Path(args.infile)
+        input_path    = Path(args.infile)
         log_file_path = input_path.with_name(f"{input_path.stem}_log.txt")
 
-        # Create log and write to _log.txt
         with open(log_file_path, "w", encoding="utf-8") as f:
-            writer = _QueueWriter(self._log_queue, f) 
+            # Write the header lines that _start_conversion already sent to the
+            # GUI log widget directly (they bypass _QueueWriter, so we echo them
+            # to the file here before redirecting stdout).
+            f.write(f"Input:  {args.infile}\n")
+            f.write(f"Output: {args.outfile}\n")
+            f.write(f"Font:   {args.font}\n")
+            f.write("─" * 60 + "\n")
+            f.flush()
+
+            writer      = _QueueWriter(self._log_queue, f)
             orig_stdout = sys.stdout
-            sys.stdout = writer
-            
-            success = False
+            sys.stdout  = writer
+
+            success  = False
+            pro_path = ""
             try:
                 with open(args.infile, "rb") as ddf, \
                      open(args.outfile, "w", encoding="utf-8", errors="replace") as kicad:
-                    Converter(ddf, kicad, args).convert()
+                    converter = Converter(ddf, kicad, args)
+                    converter.convert()
+                pro_path = str(Path(args.outfile).with_suffix(".kicad_pro"))
+                converter.write_kicad_pro(pro_path)
                 success = True
             except Exception:
                 self._log_queue.put("\n" + traceback.format_exc() + "\n")
             finally:
                 sys.stdout = orig_stdout
-        
-        self._log_queue.put("\x00DONE\x00" + ("OK" if success else "FAIL"))
+
+        self._log_queue.put("\x00DONE\x00" + ("OK:" + args.outfile + "\x01" + pro_path
+                                               if success else "FAIL"))
 
     # -----------------------------------------------------------------------
     # Log polling (runs continuously on the main thread via after())
@@ -466,7 +547,14 @@ class KiubApp(tk.Tk):
             while True:
                 text = self._log_queue.get_nowait()
                 if text.startswith("\x00DONE\x00"):
-                    self._on_conversion_done(text.endswith("OK"))
+                    payload = text[len("\x00DONE\x00"):]
+                    if payload.startswith("OK:"):
+                        parts = payload[3:].split("\x01", 1)
+                        pcb_path = parts[0]
+                        pro_path = parts[1] if len(parts) > 1 else ""
+                        self._on_conversion_done(True, pcb_path, pro_path)
+                    else:
+                        self._on_conversion_done(False, "", "")
                 else:
                     self._append_log(text)
         except queue.Empty:
@@ -534,18 +622,63 @@ class KiubApp(tk.Tk):
     # Completion callback (called from _poll_log on the main thread)
     # -----------------------------------------------------------------------
 
-    def _on_conversion_done(self, success: bool) -> None:
+    def _on_conversion_done(self, success: bool, pcb_path: str, pro_path: str) -> None:
         self._running = False
         self._start_btn.config(state=tk.NORMAL)
 
         if success:
-            out = self._outfile_var.get()
-            self._direct_log("\n✓ Conversion complete.\n", "success")
-            self._direct_log(f"  Output: {out}\n",        "success")
-            self._status_var.set(f"Done  –  {Path(out).name}")
+            self._last_pcb_path = pcb_path
+            self._open_btn.config(state=tk.NORMAL)
+            self._direct_log("\n✓ Conversion complete.\n",   "success")
+            self._direct_log(f"  PCB:     {pcb_path}\n",    "success")
+            self._direct_log(f"  Project: {pro_path}\n",    "success")
+            self._status_var.set(f"Done  –  {Path(pcb_path).name}")
         else:
             self._direct_log("\n✗ Conversion failed. See traceback above.\n", "error")
             self._status_var.set("Failed.")
+
+    # -----------------------------------------------------------------------
+    # KiCad launcher
+    # -----------------------------------------------------------------------
+
+    def _ask_kicad_exe(self) -> None:
+        """Prompt the user to locate KiCad on first run (or when path is missing)."""
+        messagebox.showinfo(
+            "KiCad location required",
+            "Please locate the KiCad executable so the 'Open in KiCad' button works.\n\n"
+            "This is saved in kiub_gui.ini and only asked once.",
+            parent=self,
+        )
+        self._change_kicad_exe()
+
+    def _change_kicad_exe(self) -> None:
+        """Let the user browse for the KiCad executable and save it."""
+        path = _browse_kicad_exe(parent=self)
+        if path:
+            self._kicad_exe = path
+            _save_kicad_exe(path)
+            self._status_var.set(f"KiCad path saved: {path}")
+
+    def _open_in_kicad(self) -> None:
+        """Launch KiCad with the last converted .kicad_pcb file."""
+        if not self._last_pcb_path:
+            return
+
+        # Re-validate the stored path in case the user changed it since startup.
+        if not self._kicad_exe or not Path(self._kicad_exe).is_file():
+            self._ask_kicad_exe()
+            if not self._kicad_exe:
+                return
+
+        try:
+            subprocess.Popen([self._kicad_exe, self._last_pcb_path])
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not launch KiCad",
+                f"Failed to start KiCad:\n{exc}\n\n"
+                "Use ⚙ KiCad Path… to set the correct executable.",
+                parent=self,
+            )
 
 
 # ---------------------------------------------------------------------------
