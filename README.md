@@ -219,8 +219,8 @@ Erratum DDF file structure
 
       Ultiboard calculates the correct value based on the chosen layer lamination sequence.
 
-      Layer mapping (Inner layer pairs are reverse mapped)
-      ----------------------------------------------------
+      Layer mapping
+      -------------
       Ultiboard           ->  Kicad layers
       pad and via layerset
       Top     00000001h       (0 "F.Cu" signal)
