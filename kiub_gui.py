@@ -136,7 +136,7 @@ def _browse_kicad_exe(parent: tk.Misc | None = None) -> str:
 
     path = filedialog.askopenfilename(
         parent=parent,
-        title="Locate the KiCad PCB executable (pcbnew or pcbnew.exe)",
+        title="Locate the KiCad executable (kicad or kicad.exe)",
         filetypes=filetypes,
     )
     return str(Path(path)) if path else ""
@@ -206,7 +206,7 @@ class KiubApp(tk.Tk):
 
         # KiCad launcher state
         self._kicad_exe:    str = _load_kicad_exe()   # '' until confirmed valid
-        self._last_pcb_path: str = ""                 # set after successful conversion
+        self._last_pro_path: str = ""                 # set after successful conversion
 
         # Font list is built once after the Tk root exists (tkfont.families()
         # requires a live Tk instance).
@@ -627,7 +627,7 @@ class KiubApp(tk.Tk):
         self._start_btn.config(state=tk.NORMAL)
 
         if success:
-            self._last_pcb_path = pcb_path
+            self._last_pro_path = pro_path
             self._open_btn.config(state=tk.NORMAL)
             self._direct_log("\n✓ Conversion complete.\n",   "success")
             self._direct_log(f"  PCB:     {pcb_path}\n",    "success")
@@ -660,8 +660,8 @@ class KiubApp(tk.Tk):
             self._status_var.set(f"KiCad path saved: {path}")
 
     def _open_in_kicad(self) -> None:
-        """Launch KiCad with the last converted .kicad_pcb file."""
-        if not self._last_pcb_path:
+        """Launch KiCad with the last converted .kicad_pro file."""
+        if not self._last_pro_path:
             return
 
         # Re-validate the stored path in case the user changed it since startup.
@@ -671,7 +671,7 @@ class KiubApp(tk.Tk):
                 return
 
         try:
-            subprocess.Popen([self._kicad_exe, self._last_pcb_path])
+            subprocess.Popen([self._kicad_exe, self._last_pro_path])
         except OSError as exc:
             messagebox.showerror(
                 "Could not launch KiCad",
