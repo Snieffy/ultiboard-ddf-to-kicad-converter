@@ -1137,8 +1137,8 @@ class Converter:
         calias = carr[1].strip("/")
         cshape = carr[2]
 
-        # Position line: <x>,<y>,<rotation>,<name_x>,<name_y>,<name_rot>,<name_h>,<name_w>,<name_thick>,
-        #                <alias_x>,<alias_y>,<alias_rot>,<alias_h>,<alias_w>,<alias_thick>
+        # Position line: <x>,<y>,<rotation>,<name_x>,<name_y>,<name_rot>,<name_w>,<name_h>,<name_thick>,
+        #                <alias_x>,<alias_y>,<alias_rot>,<alias_w>,<alias_h>,<alias_thick>
         # Rotation is in degrees × 64.
         carr   = self._readline().split(",")
         cxpos  = round(self.units_to_mm(int(carr[0])) + self.offsetX, self.di_Ac)
@@ -1149,15 +1149,15 @@ class Converter:
         cnxpos = round(-self.units_to_mm(int(carr[3])) if layerB else self.units_to_mm(int(carr[3])), self.di_Ac)
         cnypos = round(-self.units_to_mm(int(carr[4])), self.di_Ac)
         cnrot  = round(int(carr[5]) / 64 + crot, self.di_Ac)
-        cnhght = round(self.units_to_mm(int(carr[6])), self.di_Ac)
-        cnwdth = round(self.units_to_mm(int(carr[7])),  self.di_Ac)
+        cnwdth = round(self.units_to_mm(int(carr[6])), self.di_Ac)
+        cnhght = round(self.units_to_mm(int(carr[7])),  self.di_Ac)
         cnthck = round(int(carr[8]) * cnhght / self.fontThickRatio, self.di_Ac)
 
         caxpos = round(-self.units_to_mm(int(carr[9])) if layerB else self.units_to_mm(int(carr[9])), self.di_Ac)
         caypos = round(-self.units_to_mm(int(carr[10])), self.di_Ac)
         carot  = round(int(carr[11]) / 64 + crot, self.di_Ac)
-        cahght = round(self.units_to_mm(int(carr[12])), self.di_Ac)
-        cawdth = round(self.units_to_mm(int(carr[13])),  self.di_Ac)
+        cawdth = round(self.units_to_mm(int(carr[12])), self.di_Ac)
+        cahght = round(self.units_to_mm(int(carr[13])),  self.di_Ac)
         cathck = round(int(carr[14]) * cahght / self.fontThickRatio, self.di_Ac)
 
         self.ddf.readline()  # <x-force_vect>,<y-force_vect>,<Temp case>,<Temp junc>,<power>,<Rth_junc_board>,0 – not used
