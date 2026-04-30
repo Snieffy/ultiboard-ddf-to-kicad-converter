@@ -517,10 +517,13 @@ class KiubApp(tk.Tk):
             success  = False
             pro_path = ""
             try:
-                with open(args.infile, "rb") as ddf, \
-                     open(args.outfile, "w", encoding="utf-8", errors="replace") as kicad:
-                    converter = Converter(ddf, kicad, args)
-                    converter.convert()
+                ddf_handle = KIUB.open_ddf(args.infile, verbose=args.verbose)
+                try:
+                    with open(args.outfile, "w", encoding="utf-8", errors="replace") as kicad:
+                        converter = Converter(ddf_handle, kicad, args)
+                        converter.convert()
+                finally:
+                    ddf_handle.close()
                 pro_path = str(Path(args.outfile).with_suffix(".kicad_pro"))
                 converter.write_kicad_pro(pro_path)
                 success = True
