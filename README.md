@@ -33,7 +33,8 @@ Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calcul
 ## Key Features
 
 *   **Modern KiCad Support:** Generates native S-expression based `.kicad_pcb` and Json based `.kicad_pro` files.
-*   **DDF Support:** Handles both V4.x (database units) and V5.x (nanometer) files.
+*   **DDF Support:** Handles V2.x, V3.x, V4.x (database units) and V5.x (nanometer) files.
+    - V2.x and V3.x data is translated by a separate plugin (kiub_v2v3.py) before being processed by kiub.py.
 *   **Advanced Geometry:** Precision handling of tracks, vias, pads (SMD & THT), and complex copper zones.
 *   **Unicode Text Support:** Accurately converts Ultiboard internal fonts to KiCad-compatible text strings.
 *   **Zero Dependencies:** A lightweight implementation using standard Python libraries.
@@ -73,7 +74,7 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 
 > [!TIP]
 > The optional GUI allows you to easily convert DDF files.\
-> Make sure both files, KIUB.py and KIUB_gui.py, are in the same directory.\
+> Make sure all files, KIUB.py, kiub_v2v3.py  and KIUB_gui.py, are in the same directory.\
 > **Features:**
 > - Easy file selection with automatic extension name creation.
 > - Different path for the output file.
@@ -115,7 +116,7 @@ Erratum Ultiboard Reference Manual
 ----------------------------------
 - *TD Drill code value is NOT the radius but the diameter.
 - *C Component definition:
-     name and alias height, width definition is actually width, height.
+     name and alias <height>, <width> definition is actually <width>, <height>.
 
 Erratum DDF file structure 
 --------------------------
@@ -123,13 +124,19 @@ Erratum DDF file structure
 ```
 ### Ultiboard to Kicad conversion info
 ```
-- coordinates       V4.x   database units (1/1200 inch)
-                    V5.x   nanometer
-- Rotation          UB rotation value / 64 (degrees).
-- Text thickness    UB thickness value x text height / 1000.
+- coordinates       V2.x, V3.x, V4.x   database units (1/1200 inch)
+                    V5.x               nanometer
+- Rotation          V2.x, V3.x         Numeric value 0..3 for top layer
+                                                     4..7 for bottom layer
+                    V4.x, V5.x         UB rotation value / 64 (degrees).
+- Text thickness    V2.x, V3.x         text height / 6
+                    V4.x, V5.x         UB thickness value x text height / 1000.
 - Round Ratio       if x padsize <= y padsize then round ratio = UB pad radius / x padsize.
                     if x padsize >  y padsize then round ratio = UB pad radius / y padsize.
-- Shape lines       A new line segment starts when the x value in an xy pair is odd,
+- Shape lines       V2.x, V3.x
+                    List of x,y coordinate pairs
+                    V4.x, V5.x
+                    A new line segment starts when the x value in an xy pair is odd,
                     then Substract 1 from this x value to obtain the real x value.
                     If the x value in an xy pair is even, draw a line from the
                     previous xy pair to the current xy pair.
@@ -261,7 +268,7 @@ Erratum DDF file structure
 ### Features and limitations
 ```
 - The DDF board extents are used to set the appropriate paper size (A5 up to A0 is supported).
-- DDF version 4 and version 5 files supported.
+- DDF version 2, 3, 4 and version 5 files supported.
 - Handles single layer (actually also a double layer in Ultiboard),
   double layer and multilayer boards.
 - The default font is 'KiCad Font' (NewStroke), alternatives are fonts like
