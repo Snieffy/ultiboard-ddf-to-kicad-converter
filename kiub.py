@@ -17,7 +17,7 @@
 """
 KIUB: A modern Python-based converter for Ultiboard DDF to KiCad PCB.
 Based on: Ultiboard 32bit DOS and Windows95 - Reference Manual - Appendix A (1997).
-Version: 1.1.0
+Version: 2.1.0
 """
 from __future__ import annotations
 
@@ -2025,10 +2025,80 @@ class Converter:
         self._pushback_raw = (line + "\n").encode("CP437")
 
 # ---------------------------------------------------------------------------
+# open_ddf() – shared helper used by both the CLI block below and kiub_gui.py
+# ---------------------------------------------------------------------------
+
+def open_ddf(path: str, verbose: bool = False):
+    """Open a DDF file for reading, transparently pre-converting V2/V3 to V4.
+
+    Returns an open binary file-like object that Converter accepts as *ddf*.
+    The caller is responsible for closing it (use as a context manager or
+    call .close() explicitly).
+
+    For V4/V5 files a regular binary file handle is returned.
+    For V2/V3 files the conversion is performed in memory and an io.BytesIO
+    handle is returned – no intermediate file is written to disk.
+
+    Raises SystemExit if the file is V2/V3 but kiub_v2v3.py is not found.
+    """
+    import io as _io
+
+    # ------------------------------------------------------------------
+    # Peek at the *P record to read the DDF major version number.
+    # The version line immediately follows *P and looks like "4 60" or "3 3".
+    # We only read the first 10 lines so this is effectively free.
+    # ------------------------------------------------------------------
+    ddf_version = 4   # safe default
+    with open(path, 'rb') as _f:
+        for _ in range(5):
+            raw = _f.readline()
+            if not raw:
+                break
+            line = raw.decode('CP437', errors='replace').strip()
+            if line.startswith('*P'):
+                ver_line = _f.readline().decode('CP437', errors='replace').strip()
+                try:
+                    ddf_version = int(ver_line.split()[0])
+                except (ValueError, IndexError):
+                    pass
+                break
+
+    if ddf_version in (2, 3):
+        # ── V2/V3: import kiub_v2v3 and pre-convert in memory ────────────
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _v2v3_path = os.path.join(_here, "kiub_v2v3.py")
+        if not os.path.exists(_v2v3_path):
+            print(
+                "Error: kiub_v2v3.py not found.\n"
+                "Place kiub_v2v3.py in the same folder as kiub.py to convert V2/V3 files."
+            )
+            sys.exit(1)
+
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("kiub_v2v3", _v2v3_path)
+        _mod  = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        if verbose:
+            print(f"DDF version {ddf_version} detected – pre-converting via kiub_v2v3…")
+
+        with open(path, 'r', encoding='CP437', errors='replace') as _src:
+            _v4_str = _mod.convert_str(_src.read())
+
+        return _io.BytesIO(_v4_str.encode('CP437'))
+
+    else:
+        # ── V4/V5: open normally ──────────────────────────────────────────
+        if verbose and ddf_version != 4:
+            print(f"DDF version {ddf_version} detected.")
+        return open(path, 'rb')
+
+
+# ---------------------------------------------------------------------------
 # CLI and entry point
 # ---------------------------------------------------------------------------
 
-parser = argparse.ArgumentParser(description='Convert UltiBoard V4 and V5 DDFs to KiCad pcb.')
+parser = argparse.ArgumentParser(description='Convert UltiBoard V2/V3/V4/V5 DDFs to KiCad pcb.')
 parser.add_argument('infile', help='Ultiboard DDF file (with or without the .DDF file extension).')
 parser.add_argument('-o', '--outfile', help='Kicad PCB file (with or without the .kicad_pcb file extension).')
 parser.add_argument('-f', '--font', default='KiCad Font', help='use a different font.')
@@ -2050,10 +2120,13 @@ if args.verbose:
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"Ultiboard file: {args.infile}\nKicad file:     {args.outfile}")
 
-with open(args.infile, 'rb') as ddf, \
-     open(args.outfile, 'w', encoding='utf-8', errors='replace') as kicad:
-    converter = Converter(ddf, kicad, args)
-    converter.convert()
+ddf_handle = open_ddf(args.infile, verbose=args.verbose)
+try:
+    with open(args.outfile, 'w', encoding='utf-8', errors='replace') as kicad:
+        converter = Converter(ddf_handle, kicad, args)
+        converter.convert()
+finally:
+    ddf_handle.close()
 
 pro_path = os.path.splitext(args.outfile)[0] + '.kicad_pro'
 converter.write_kicad_pro(pro_path)
