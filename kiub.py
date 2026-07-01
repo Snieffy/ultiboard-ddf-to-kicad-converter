@@ -263,16 +263,36 @@ HEADER_TEMPLATE: str = """\
 
 def ubfont(payload: bytes) -> str:
     """Convert CP437/CP850 Ultiboard font bytes to a Unicode string."""
+
     chars: list[str] = []
+    overline: list[str] = []
     overline_active = False
+
     for b in payload:
         if b == 94:  # Ultiboard uses '^' as start/end toggle for overline text.
+            if overline_active:
+                # Closing overline marker.
+                chars.append(f"~{{{''.join(overline)}}}")
+                overline.clear()
+
             overline_active = not overline_active
             continue
+
         ch = ub_fontmap.get(bytes([b]), "?")
+
+        # Escape double-quotes and backslashes.
+        if ch in ('"', "\\"):
+            ch = "\\" + ch
+
         if overline_active:
-            chars.append("\u0305")  # KiCad needs the combining overline character before the base character.
-        chars.append("\\" + ch if ch in ('"', "\\") else ch)  # Escape double-quotes and backslashes.
+            overline.append(ch)
+        else:
+            chars.append(ch)
+
+    # Handle an unmatched '^' at end of string.
+    if overline_active and overline:
+        chars.append(f"~{{{''.join(overline)}}}")
+
     return "".join(chars)
 
 
