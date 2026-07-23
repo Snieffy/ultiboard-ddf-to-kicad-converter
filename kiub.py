@@ -220,7 +220,7 @@ HEADER_TEMPLATE: str = """\
 (kicad_pcb (version 20241029) (generator "KIUB") (generator_version "1.1.0")
 
   (general
-    (thickness 1.6)
+    (thickness {board_thickness})
     (legacy_teardrops no)
   )
 
@@ -251,11 +251,196 @@ HEADER_TEMPLATE: str = """\
   )
 
   (setup
-    (pad_to_mask_clearance 0.051)
-    (solder_mask_min_width 0.15)
+    (pad_to_mask_clearance {pad_to_mask_clearance})
+    (solder_mask_min_width {solder_mask_min_width})
+    (pad_to_paste_clearance {pad_to_paste_clearance})
+    (pad_to_paste_clearance_ratio {pad_to_paste_clearance_ratio})
   )
 
 """
+
+# ---------------------------------------------------------------------------
+# Board-defaults registry (single source of truth for the editable clearance
+# options below). Each entry is (name, default, lo, hi, description, target)
+# where target is 'kicad_pcb' (written to the (setup) section) or
+# 'kicad_pro' (written to board.design_settings.rules). Both the CLI's
+# argparse defaults and the GUI's fine-tuning pop-up (kiub_gui.py's
+# _BoardDefaultsDialog) walk this table, so adding a new tunable later only
+# requires adding one entry here. Mirrors KIUC's TUNING_SPEC/kiuc.ini pattern
+# (kiuc_writer.py / kiuc_gui.py) so both tools share the same UX.
+# ---------------------------------------------------------------------------
+
+BOARD_DEFAULTS_SPEC: list[tuple[str, float, float, float, str, str]] = [
+    ('pad_to_mask_clearance', 0.05, -1.0, 1.0,
+     "Solder mask expansion around each pad, mm. Positive values enlarge "
+     "the mask opening beyond the pad edge.",
+     'kicad_pcb'),
+    ('solder_mask_min_width', 0.15, 0.0, 1.0,
+     "Minimum solder mask web width between adjacent mask openings, mm. "
+     "Openings closer than this are merged by KiCad's plotter.",
+     'kicad_pcb'),
+    ('pad_to_paste_clearance', 0.0, -1.0, 1.0,
+     "Solder paste absolute clearance from the pad edge, mm (negative "
+     "shrinks the paste aperture, e.g. for fine-pitch parts).",
+     'kicad_pcb'),
+    ('pad_to_paste_clearance_ratio', 0.0, -1.0, 1.0,
+     "Solder paste relative clearance, as a ratio of pad size (added to "
+     "the absolute clearance above).",
+     'kicad_pcb'),
+    ('solder_mask_to_copper_clearance', 0.0, 0.0, 1.0,
+     "Minimum clearance the DRC enforces between solder mask openings and "
+     "copper, mm.",
+     'kicad_pro'),
+]
+
+
+def get_board_default(name: str) -> float:
+    """Return the spec default for a board-defaults entry by name."""
+    for n, default, *_ in BOARD_DEFAULTS_SPEC:
+        if n == name:
+            return default
+    raise KeyError(name)
+
+
+# ---------------------------------------------------------------------------
+# NUT constants (Non-User-Tunable)
+#
+# Fixed by the DDF format, the KiCad file format, or a DRC/connectivity
+# requirement. Never exposed via CLI flag, GUI dialog, or FINE_TUNING_SPEC --
+# changing any of these either produces an invalid file, changes what a
+# value structurally *means* (not just its magnitude), or risks a DRC
+# violation with no corresponding benefit.
+# ---------------------------------------------------------------------------
+
+BOARD_THICKNESS_MM: float = 1.6
+# Fixed PCB stack thickness written to kicad_pcb's (general) section.
+# Ultiboard DOS has no per-board thickness setting to derive this from --
+# it's a KiCad-only concept, so there's nothing meaningful to "tune" it
+# against.
+
+DIFF_PAIR_GAP_RATIO: float = 1.5
+# diff_pair_gap / diff_pair_via_gap = min_clearance * this ratio, written to
+# each net class in the .kicad_pro. KiCad-only concept -- Ultiboard DOS has
+# no differential-pair support to mirror or validate this against.
+
+PTH_PAD_MIN_ANNULAR_MM: float = 0.01
+# Added to the drill diameter when auto-generating a copper pad for a PTH
+# hole that has no explicit pad code in the DDF (round pads only -- see
+# PTH_PAD_ROUND_RATIO below). This is a DELIBERATE minimum annular ring,
+# not a float-rounding fudge -- an earlier version of this code carried a
+# comment claiming it avoided "IEEE noise", which was incorrect. KiCad
+# requires some copper annulus around a plated hole for electrical
+# connectivity; a zero-width annulus produces a DRC error (traces routed
+# near an effectively padless PTH hole). Do not remove or reduce this.
+
+PTH_PAD_ROUND_RATIO: float = 0.5
+# roundrect_rratio for the auto-generated PTH pads described above; 0.5
+# makes the pad a perfect circle. This is what actually declares "this is
+# a round pad", not merely how rounded its corners are -- changing it
+# changes the pad shape itself, so it must stay fixed.
+
+NPTH_ZERO_CLEARANCE_MM: float = 0.15
+# Clearance substituted for NPTH pads whose DDF-specified clearance is
+# zero. Kept fixed for now. If this is ever made user-tunable, it must be
+# hard-clamped to 0.10-0.15mm -- values outside that band have been
+# observed to introduce DRC clearance violations.
+
+SMD_MIN_DRILL_MM: float = 0.05
+# Drills smaller than this are treated as the special "SMD trick" case and
+# set to KiCad's -1 sentinel (never actually drilled). Ultiboard DOS cannot
+# place two SMD pads from opposite layers at exactly the same X/Y
+# coordinate, so such layouts are built in Ultiboard with a tiny
+# non-drilled microhole between the two pads purely to satisfy Ultiboard's
+# own placement rules; that hole must not become a real drilled hole in
+# KiCad.
+
+FONT_THICKNESS_DIVISOR: int = 1000
+# Ultiboard's own font-format definition: stroke thickness = thickness
+# field x text height / 1000. Not a KIUB choice -- fixed by the DDF font
+# encoding itself.
+
+_ANNULAR_WIDTH_NOISE_EPS_MM: float = 1e-4
+# Below this, an apparent annular-ring width is treated as float-rounding
+# noise (i.e. effectively zero) rather than a genuine measurement, when
+# scanning pads/vias for the smallest annular width on the board.
+
+_KICAD_NEAR_ZERO_MM: float = 0.000001
+# Near-zero sentinel that KiCad accepts without silently rewriting to a
+# different value, used as a fallback where a true zero would be
+# ambiguous with "field not set".
+
+
+# ---------------------------------------------------------------------------
+# Fine-tuning registry (user-adjustable geometry/style constants)
+#
+# Surfaced in kiub_gui.py's separate "Fine-tuning…" dialog (kept apart from
+# "Board defaults…", which holds only true manufacturing clearances written
+# straight into kicad_pcb/kicad_pro). Mirrors KIUC's TUNING_SPEC/kiuc.ini
+# pattern (kiuc_writer.py / kiuc_gui.py) so both tools share the same UX.
+#
+# category:
+#   'geometry'  -- affects visual/rendering fit only (text size, line
+#                  widths, outline snapping); safe to adjust freely.
+#   'clearance' -- fallback copper clearances/widths used only where the
+#                  DDF doesn't specify a value of its own; alter cautiously,
+#                  since values set too aggressively can trigger DRC
+#                  clearance violations elsewhere on the board.
+# ---------------------------------------------------------------------------
+
+FINE_TUNING_SPEC: list[tuple[str, float, float, float, str, str]] = [
+    ('font_height_ratio', 1.208, 1.0, 1.5,
+     "KiCad text height = Ultiboard text height \u00f7 this ratio. "
+     "Empirically fitted so converted text visually matches Ultiboard's "
+     "own rendering.",
+     'geometry'),
+    ('font_width_ratio', 1.186, 1.0, 1.5,
+     "KiCad text width = Ultiboard text width \u00d7 this ratio. "
+     "Empirically fitted, paired with font_height_ratio.",
+     'geometry'),
+    ('line_width', 0.075, 0.01, 0.5,
+     "Default width for lines, arcs, and circles (board outline, silk, "
+     "etc.) wherever the DDF doesn't specify one of its own, mm.",
+     'geometry'),
+    ('snap_tolerance', 0.1, 0.0, 1.0,
+     "Maximum gap, mm, between adjacent board-outline endpoints before "
+     "they're snapped closed into a single continuous outline.",
+     'geometry'),
+    ('default_clearance', 0.254, 0.05, 0.5,
+     "Fallback copper clearance, mm, used where the DDF doesn't specify "
+     "one. Alter cautiously -- values set too low can produce DRC "
+     "clearance violations elsewhere on the board.",
+     'clearance'),
+    ('default_width', 0.254, 0.05, 0.5,
+     "Fallback copper trace width, mm, used where the DDF doesn't specify "
+     "one. Alter cautiously -- affects current-carrying capacity and DRC.",
+     'clearance'),
+    ('default_thermal_gap', 0.254, 0.05, 0.5,
+     "Fallback thermal-relief air gap (spoke-to-pad), mm, used where the "
+     "DDF doesn't specify one. Alter cautiously.",
+     'clearance'),
+    ('default_thermal_width', 0.254, 0.05, 0.5,
+     "Fallback thermal-relief spoke width, mm, used where the DDF doesn't "
+     "specify one. Alter cautiously.",
+     'clearance'),
+    ('v2v3_text_width_ratio', 0.8, 0.3, 1.5,
+     "DDF V2/V3 pre-conversion only: estimated text width = text height "
+     "\u00d7 this ratio (unlike V4/V5, V2/V3 DDFs don't store text width "
+     "directly).",
+     'geometry'),
+    ('v2v3_text_thickness_ratio', 0.1667, 0.05, 0.5,
+     "DDF V2/V3 pre-conversion only: estimated text stroke thickness = "
+     "text height \u00d7 this ratio.",
+     'geometry'),
+]
+
+
+def get_fine_tuning_default(name: str) -> float:
+    """Return the spec default for a fine-tuning entry by name."""
+    for n, default, *_ in FINE_TUNING_SPEC:
+        if n == name:
+            return default
+    raise KeyError(name)
+
 
 # ---------------------------------------------------------------------------
 # Pure helper functions (no state)
@@ -359,24 +544,44 @@ def calc_arc_points(
 class Converter:
     """Holds all conversion state and one handler method per DDF record type."""
 
-    # Default settings
-    NPTHclearance:       float = 0.15    # Hole clearance for NPTH pads – used when pad clearance is zero.
-    dcMin:               float = 0.05   # Smallest drill diameter (mm); drills below this are set to -1 (SMD special case).
-    lineWidth:           float = 0.075  # Default width for lines, arcs and circles.
-    defaultClearance:    float = 0.254  # Default clearance.
-    defaultWidth:        float = 0.254  # Default copper width.
-    defaultThermalGap:   float = 0.254  # Default thermal gap.
-    defaultThermalWidth: float = 0.254  # Default thermal bridge width.
-    fontThickRatio:      int   = 1000   # Font thickness divisor: thickness = value × height / 1000 (Ultiboard definition).
-    fontHeightRatio:     float = 1.208  # Text height scale: KiCad height = Ultiboard height / fontHeightRatio.
-    fontWidthRatio:      float = 1.186  # Text width  scale: KiCad width  = Ultiboard width  × fontWidthRatio.
-    snapTolerance:       float = 0.1    # Maximum gap (mm) between adjacent board-outline endpoints to snap closed.
+    # Default settings.
+    # NUT (fixed, never overridden from args -- see the NUT constants block
+    # near the top of this file for why):
+    NPTHclearance:       float = NPTH_ZERO_CLEARANCE_MM  # Hole clearance for NPTH pads – used when pad clearance is zero.
+    dcMin:               float = SMD_MIN_DRILL_MM        # Smallest drill diameter (mm); drills below this are set to -1 (SMD special case).
+    fontThickRatio:      int   = FONT_THICKNESS_DIVISOR  # Font thickness divisor: thickness = value × height / 1000 (Ultiboard definition).
+    # Fine-tunable (see FINE_TUNING_SPEC): these are the built-in defaults;
+    # __init__ overrides them per-instance from self.args when a CLI flag or
+    # GUI "Fine-tuning…" value is present.
+    lineWidth:           float = get_fine_tuning_default('line_width')
+    defaultClearance:    float = get_fine_tuning_default('default_clearance')
+    defaultWidth:        float = get_fine_tuning_default('default_width')
+    defaultThermalGap:   float = get_fine_tuning_default('default_thermal_gap')
+    defaultThermalWidth: float = get_fine_tuning_default('default_thermal_width')
+    fontHeightRatio:     float = get_fine_tuning_default('font_height_ratio')
+    fontWidthRatio:      float = get_fine_tuning_default('font_width_ratio')
+    snapTolerance:       float = get_fine_tuning_default('snap_tolerance')
 
     def __init__(self, ddf: IO[bytes], kicad: IO[str],
                  args: argparse.Namespace) -> None:
         self.ddf   = ddf
         self.kicad = kicad
         self.args  = args
+
+        # Fine-tunable geometry/clearance defaults (see FINE_TUNING_SPEC) --
+        # overridden here from a CLI flag or the GUI's "Fine-tuning…" dialog
+        # when present, otherwise falling back to the class-level default.
+        # NPTHclearance/dcMin/fontThickRatio are NUT and deliberately NOT
+        # overridden here -- see the NUT constants block near the top of
+        # this file.
+        self.lineWidth           = getattr(args, 'line_width', Converter.lineWidth)
+        self.defaultClearance    = getattr(args, 'default_clearance', Converter.defaultClearance)
+        self.defaultWidth        = getattr(args, 'default_width', Converter.defaultWidth)
+        self.defaultThermalGap   = getattr(args, 'default_thermal_gap', Converter.defaultThermalGap)
+        self.defaultThermalWidth = getattr(args, 'default_thermal_width', Converter.defaultThermalWidth)
+        self.fontHeightRatio     = getattr(args, 'font_height_ratio', Converter.fontHeightRatio)
+        self.fontWidthRatio      = getattr(args, 'font_width_ratio', Converter.fontWidthRatio)
+        self.snapTolerance       = getattr(args, 'snap_tolerance', Converter.snapTolerance)
 
         # DDF version and numeric precision – updated in _handle_header
         self.DDF_major: int | str = 4
@@ -570,8 +775,19 @@ class Converter:
         if self.args.verbose:
             print(f"\n{maxLayers} layers:\n{layers_p}\n")
 
-        self.kicad.write(HEADER_TEMPLATE.format(PCBlayers=layers_p,
-                                                papersize=f'"{sheetSize}"'))
+        self.kicad.write(HEADER_TEMPLATE.format(
+            PCBlayers=layers_p,
+            papersize=f'"{sheetSize}"',
+            board_thickness=BOARD_THICKNESS_MM,
+            pad_to_mask_clearance=getattr(self.args, "pad_to_mask_clearance",
+                                          get_board_default("pad_to_mask_clearance")),
+            solder_mask_min_width=getattr(self.args, "solder_mask_min_width",
+                                           get_board_default("solder_mask_min_width")),
+            pad_to_paste_clearance=getattr(self.args, "pad_to_paste_clearance",
+                                           get_board_default("pad_to_paste_clearance")),
+            pad_to_paste_clearance_ratio=getattr(self.args, "pad_to_paste_clearance_ratio",
+                                                 get_board_default("pad_to_paste_clearance_ratio")),
+        ))
         self.kicad.write('  (net 0 "")\n')   # KiCad net 0 must always be an empty (unconnected) net.
 
         for _ in range(3):
@@ -1116,7 +1332,7 @@ class Converter:
                    self.pads[int(line[2])].iloc[didx]['Xsize'] == 0:
                     self.pads[int(line[2])].loc[didx, 'Xsize']      = self.drillCode[didx]
                     self.pads[int(line[2])].loc[didx, 'Ysize']      = self.drillCode[didx]
-                    self.pads[int(line[2])].loc[didx, 'roundratio'] = 0.5
+                    self.pads[int(line[2])].loc[didx, 'roundratio'] = PTH_PAD_ROUND_RATIO
                     self.pads[int(line[2])].loc[didx, 'clearance']  = self.NPTHclearance
 
 
@@ -1330,10 +1546,11 @@ class Converter:
 
         if padshape == "thru_hole roundrect":
             # PTH drill pad: create a pad slightly larger than the drill hole so KiCad
-            # has a copper annulus to attach the net to.
-            pad_w = pad_h = round(drCode + 0.01, self.di_Ac)   # +0.01 rounded to avoid IEEE noise.
+            # has a copper annulus to attach the net to (deliberate minimum annular
+            # ring -- see PTH_PAD_MIN_ANNULAR_MM; this is NOT a float-rounding fudge).
+            pad_w = pad_h = round(drCode + PTH_PAD_MIN_ANNULAR_MM, self.di_Ac)
             pad_offset    = 0
-            pad_rr        = 0.5
+            pad_rr        = PTH_PAD_ROUND_RATIO
         else:
             pad_w      = self.pads[layer_idx].at[pad['code'], 'Xsize']
             pad_h      = self.pads[layer_idx].at[pad['code'], 'Ysize']
@@ -1472,10 +1689,10 @@ class Converter:
         anetnr      = self._map_ddf_to_kicad_net(aline[6])
         atcode      = aline[7]
         # Zero width causes a KiCad import bug: it is silently changed to 0.1mm.
-        # Use 0.000001 as a near-zero sentinel that KiCad accepts without altering.
+        # Use _KICAD_NEAR_ZERO_MM as a near-zero sentinel that KiCad accepts without altering.
         atWidth: float = (
-            self.units_to_mm(self.traceWidth[atcode]) if atcode != 65535 else 0.000001
-        ) or 0.000001
+            self.units_to_mm(self.traceWidth[atcode]) if atcode != 65535 else _KICAD_NEAR_ZERO_MM
+        ) or _KICAD_NEAR_ZERO_MM
 
         aclr = self.traceClearance.get(atcode, 0)
         if aclr > 0 and anetnr > 0 and atcode != 65535:
@@ -1785,14 +2002,14 @@ class Converter:
                 if xsize <= 0 or ysize <= 0:
                     continue
                 ann = (xsize - ysize) / 2 - abs(xoffset)
-                if ann > 1e-4:                                 # ignore float-rounding noise
+                if ann > _ANNULAR_WIDTH_NOISE_EPS_MM:               # ignore float-rounding noise
                     annular_widths.append(round(ann, self.di_Ac))
         for code in range(240, 256):
             pad_y = self.pads[0].at[code, 'Ysize']
             drill = self.drillCode[code]
             if pad_y > 0 and drill > 0:
                 ann = (pad_y - drill) / 2
-                if ann > 1e-4:
+                if ann > _ANNULAR_WIDTH_NOISE_EPS_MM:
                     annular_widths.append(round(ann, self.di_Ac))
         min_annular_width = round(min(annular_widths), self.di_Ac) if annular_widths \
                             else round((min_via_diameter - min_via_drill) / 2, self.di_Ac)
@@ -1815,8 +2032,8 @@ class Converter:
         netclass_entries.append({
             "bus_width":         12,
             "clearance":         min_trace_clearance,
-            "diff_pair_gap":     round(min_trace_clearance * 1.5, self.di_Ac),
-            "diff_pair_via_gap": round(min_trace_clearance * 1.5, self.di_Ac),
+            "diff_pair_gap":     round(min_trace_clearance * DIFF_PAIR_GAP_RATIO, self.di_Ac),
+            "diff_pair_via_gap": round(min_trace_clearance * DIFF_PAIR_GAP_RATIO, self.di_Ac),
             "diff_pair_width":   min_track_width,
             "line_style":        0,
             "microvia_diameter": min_via_diameter,
@@ -1858,8 +2075,8 @@ class Converter:
             netclass_entries.append({
                 "bus_width":         12,
                 "clearance":         round(effective_clearance_mm, self.di_Ac),
-                "diff_pair_gap":     round(effective_clearance_mm * 1.5, self.di_Ac),
-                "diff_pair_via_gap": round(effective_clearance_mm * 1.5, self.di_Ac),
+                "diff_pair_gap":     round(effective_clearance_mm * DIFF_PAIR_GAP_RATIO, self.di_Ac),
+                "diff_pair_via_gap": round(effective_clearance_mm * DIFF_PAIR_GAP_RATIO, self.di_Ac),
                 "diff_pair_width":   round(width_mm, self.di_Ac),
                 "line_style":        0,
                 "microvia_diameter": min_via_diameter,
@@ -1899,9 +2116,8 @@ class Converter:
 
         # ── Assemble JSON ────────────────────────────────────────────────────
 
-        pro: dict = {
-            "board": {
-                "design_settings": {
+        board_section: dict = {
+            "design_settings": {
                     "defaults": {
                         "board_outline_line_width": self.lineWidth,
                         "copper_line_width":        self.lineWidth,
@@ -1932,7 +2148,9 @@ class Converter:
                         "min_track_width":                min_track_width,
                         "min_via_annular_width":          min_annular_width,
                         "min_via_diameter":               min_via_diameter,
-                        "solder_mask_to_copper_clearance": 0.0,
+                        "solder_mask_to_copper_clearance": getattr(
+                            self.args, "solder_mask_to_copper_clearance",
+                            get_board_default("solder_mask_to_copper_clearance")),
                         "use_height_for_length_calcs":    True,
                     },
                     "rule_severities": {
@@ -1995,39 +2213,77 @@ class Converter:
                         "zones_intersect":                     "error",
                     },
                 },
-            },
-            "meta": {
-                "filename": os.path.basename(pro_path),
-                "version":  1,
-            },
-            "net_settings": {
-                "classes":              netclass_entries,
-                "meta":                 {"version": 3},
-                "net_colors":           None,
-                "netclass_assignments": None,
-                "netclass_patterns":    netclass_patterns,
-            },
-            "pcbnew": {
-                "last_paths": {
-                    "gencad":      "",
-                    "idf":         "",
-                    "netlist":     "",
-                    "plot":        "",
-                    "pos_files":   "",
-                    "specctra_dsn": "",
-                    "step":        "",
-                    "svg":         "",
-                    "vrml":        "",
-                },
-                "page_layout_descr_file": "",
-            },
-            "schematic": {
-                "meta": {"version": 1},
-            },
         }
 
+        net_settings_section: dict = {
+            "classes":              netclass_entries,
+            "meta":                 {"version": 3},
+            "net_colors":           None,
+            "netclass_assignments": None,
+            "netclass_patterns":    netclass_patterns,
+        }
+
+        pcbnew_last_paths: dict = {
+            "gencad":       "",
+            "idf":          "",
+            "netlist":      "",
+            "plot":         "",
+            "pos_files":    "",
+            "specctra_dsn": "",
+            "step":         "",
+            "svg":          "",
+            "vrml":         "",
+        }
+
+        # ── Create-or-update ─────────────────────────────────────────────────
+        # KIUB owns "board", "net_settings", and pcbnew.last_paths. If a
+        # .kicad_pro already exists at this path -- most commonly because
+        # KIUC created one first from the matching schematic -- it is loaded
+        # and only KIUB's own keys are touched; every KIUC-owned key (erc,
+        # schematic.*, sheets, libraries, cvpcb, text_variables, ...) is left
+        # exactly as found. This mirrors KIUC's own write_kicad_pro() merge
+        # logic (kiuc_writer.py) so both tools can write into the same
+        # project file without clobbering each other's settings, regardless
+        # of which one runs first.
+        if os.path.exists(pro_path):
+            try:
+                with open(pro_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                # Corrupt or unreadable existing file -- do not attempt to
+                # patch something that can't be parsed; start from a clean,
+                # minimal structure instead of silently destroying whatever
+                # was there.
+                data = {}
+                if self.args.verbose:
+                    print(f"  Warning: existing {pro_path} could not be "
+                          f"parsed; rebuilding it from scratch.")
+
+            data["board"] = board_section
+            data.setdefault("meta", {})
+            data["meta"]["filename"] = os.path.basename(pro_path)
+            data["meta"].setdefault("version", 1)
+            data["net_settings"] = net_settings_section
+            data.setdefault("pcbnew", {})
+            data["pcbnew"].setdefault("last_paths", {})
+            data["pcbnew"]["last_paths"].update(pcbnew_last_paths)
+            data["pcbnew"].setdefault("page_layout_descr_file", "")
+            data.setdefault("schematic", {"meta": {"version": 1}})
+
+            if self.args.verbose:
+                print(f"  Existing .kicad_pro found at {pro_path} -- "
+                      f"updating board/net_settings/pcbnew.last_paths only.")
+        else:
+            data = {
+                "board":        board_section,
+                "meta":         {"filename": os.path.basename(pro_path), "version": 1},
+                "net_settings": net_settings_section,
+                "pcbnew":       {"last_paths": pcbnew_last_paths, "page_layout_descr_file": ""},
+                "schematic":    {"meta": {"version": 1}},
+            }
+
         with open(pro_path, 'w', encoding='utf-8') as f:
-            json.dump(pro, f, indent=2)
+            json.dump(data, f, indent=2)
             f.write('\n')
 
     # -----------------------------------------------------------------------
@@ -2048,7 +2304,7 @@ class Converter:
 # open_ddf() – shared helper used by both the CLI block below and kiub_gui.py
 # ---------------------------------------------------------------------------
 
-def open_ddf(path: str, verbose: bool = False):
+def open_ddf(path: str, verbose: bool = False, args: argparse.Namespace | None = None):
     """Open a DDF file for reading, transparently pre-converting V2/V3 to V4.
 
     Returns an open binary file-like object that Converter accepts as *ddf*.
@@ -2058,6 +2314,10 @@ def open_ddf(path: str, verbose: bool = False):
     For V4/V5 files a regular binary file handle is returned.
     For V2/V3 files the conversion is performed in memory and an io.BytesIO
     handle is returned – no intermediate file is written to disk.
+
+    If *args* carries 'v2v3_text_width_ratio'/'v2v3_text_thickness_ratio'
+    (see FINE_TUNING_SPEC), these override kiub_v2v3's own built-in
+    defaults for this conversion; otherwise kiub_v2v3's defaults apply.
 
     Raises SystemExit if the file is V2/V3 but kiub_v2v3.py is not found.
     """
@@ -2099,6 +2359,14 @@ def open_ddf(path: str, verbose: bool = False):
         _mod  = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
 
+        # Propagate fine-tuning overrides (if any) into kiub_v2v3's own
+        # module-level constants before conversion.
+        if args is not None:
+            _mod.TEXT_WIDTH_RATIO = getattr(
+                args, 'v2v3_text_width_ratio', getattr(_mod, 'TEXT_WIDTH_RATIO', 0.8))
+            _mod.TEXT_THICKNESS_RATIO = getattr(
+                args, 'v2v3_text_thickness_ratio', getattr(_mod, 'TEXT_THICKNESS_RATIO', 0.1667))
+
         if verbose:
             print(f"DDF version {ddf_version} detected – pre-converting via kiub_v2v3…")
 
@@ -2115,6 +2383,57 @@ def open_ddf(path: str, verbose: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Non-digit-ending refdes pre-scan (lightweight, read-only – see KIUC's
+# kiuc_refdes.py "Refdes Reannotate" tool for the actual renaming logic,
+# which is out of scope for KIUB).
+# ---------------------------------------------------------------------------
+
+# Matches a DDF '*C <refdes> ...' component-definition line. Confirmed stable
+# across DDF V2.x-V5.x by KIUC's kiuc_refdes.py, which uses the same shape.
+_REFDES_LINE_RE = re.compile(r'^\*C (\S+) ', re.MULTILINE)
+
+
+def scan_non_digit_refdes(ddf_text: str) -> list[str]:
+    """Return every unique component reference designator (from '*C' records)
+    that does NOT end in a digit, in first-seen order.
+
+    This is a simple "ends in a digit" check -- unlike KIUC's schematic-side
+    Refdes Reannotate tool, a DDF/PCB component has no equivalent of a
+    multi-unit symbol (e.g. gates U2A/U2B of one physical IC), so there is
+    no case here where a trailing letter after a digit should be treated as
+    already-annotated.
+
+    Read-only: does not rename anything. KIUB never edits reference
+    designators itself -- if a schematic exists for this board (whether or
+    not it's found sitting next to the DDF), KIUC's Refdes Reannotate tool
+    is the only place renaming should happen, since it's what keeps the
+    schematic and PCB in sync; renaming independently of it breaks that
+    sync.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for m in _REFDES_LINE_RE.finditer(ddf_text):
+        rd = m.group(1)
+        if rd and not rd[-1].isdigit() and rd not in seen_set:
+            seen_set.add(rd)
+            seen.append(rd)
+    return seen
+
+
+def find_sibling_schematic(ddf_path: str) -> str | None:
+    """Return the path to a sibling schematic next to the given DDF file,
+    if one exists (checked as '<same stem>.SCH', '.sch', or '.kicad_sch').
+    Returns None if no sibling schematic is found.
+    """
+    stem = os.path.splitext(ddf_path)[0]
+    for ext in ('.SCH', '.sch', '.kicad_sch'):
+        candidate = stem + ext
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CLI and entry point
 # ---------------------------------------------------------------------------
 
@@ -2123,6 +2442,16 @@ parser.add_argument('infile', help='Ultiboard DDF file (with or without the .DDF
 parser.add_argument('-o', '--outfile', help='Kicad PCB file (with or without the .kicad_pcb file extension).')
 parser.add_argument('-f', '--font', default='KiCad Font', help='use a different font.')
 parser.add_argument('-v', '--verbose', action='store_true', help='Display conversion information.')
+for _name, _default, _lo, _hi, _desc, _target in BOARD_DEFAULTS_SPEC:
+    parser.add_argument(
+        f'--{_name.replace("_", "-")}', type=float, default=_default, dest=_name,
+        help=f'{_desc} (written to {_target}). Default: {_default}, suggested range {_lo}-{_hi}.')
+for _name, _default, _lo, _hi, _desc, _category in FINE_TUNING_SPEC:
+    parser.add_argument(
+        f'--{_name.replace("_", "-")}', type=float, default=_default, dest=_name,
+        help=f'[fine-tuning/{_category}] {_desc} Default: {_default:.6g}, suggested range {_lo}-{_hi}.')
+parser.add_argument('--yes', action='store_true',
+                    help='Do not prompt when non-digit-ending reference designators are found; continue automatically.')
 
 args = parser.parse_args()
 
@@ -2140,7 +2469,35 @@ if args.verbose:
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"Ultiboard file: {args.infile}\nKicad file:     {args.outfile}")
 
-ddf_handle = open_ddf(args.infile, verbose=args.verbose)
+ddf_handle = open_ddf(args.infile, verbose=args.verbose, args=args)
+
+# ── Non-digit-ending refdes pre-scan (read-only; see scan_non_digit_refdes) ──
+_ddf_raw = ddf_handle.read()
+ddf_handle.seek(0)
+_offending_refs = scan_non_digit_refdes(_ddf_raw.decode('CP437', errors='replace'))
+if _offending_refs:
+    print("\nWarning: the following component reference designators do not end in a digit:")
+    for _rd in _offending_refs:
+        print(f"  {_rd}")
+    _sibling = find_sibling_schematic(args.infile)
+    if _sibling:
+        print(f"\nA sibling schematic was found: {_sibling}")
+        print("Run KIUC's Refdes Reannotate tool FIRST, before changing any of these")
+        print("references -- it is what keeps the schematic and PCB in sync. Renaming")
+        print("them directly (in the PCB or the schematic alone) will break that sync.")
+    else:
+        print("\nNo sibling schematic (.SCH/.kicad_sch) was found next to this DDF.")
+        print("KiCad's PCB editor accepts non-digit-ending references without issue, so")
+        print("no action is needed if this board has no schematic. If a schematic for")
+        print("this board exists elsewhere, run KIUC's Refdes Reannotate tool first --")
+        print("renaming these independently of that schematic will break their sync.")
+    if not args.yes:
+        _reply = input("\nContinue with the conversion anyway? [y/N]: ").strip().lower()
+        if _reply != 'y':
+            print("Conversion aborted.")
+            ddf_handle.close()
+            sys.exit(1)
+
 try:
     with open(args.outfile, 'w', encoding='utf-8', errors='replace') as kicad:
         converter = Converter(ddf_handle, kicad, args)

@@ -40,6 +40,18 @@ ROT_MAP = {
     4: -23040, 5: -5760, 6: -11520, 7: -17280
 }
 
+# ---------------------------------------------------------------------------
+# Fine-tunable text-geometry estimation ratios (see kiub.py's FINE_TUNING_SPEC,
+# entries 'v2v3_text_width_ratio' / 'v2v3_text_thickness_ratio'). Unlike V4/V5,
+# V2/V3 DDFs only store a text *height* per shape/alias/component-text record
+# -- width and stroke thickness aren't stored at all, so both are estimated
+# from height using these empirically-fitted ratios. When this module is
+# loaded by kiub.py's open_ddf(), these two module attributes may be
+# overridden per-conversion from a CLI flag or the GUI's "Fine-tuning…"
+# dialog; running this file standalone always uses the defaults below.
+TEXT_WIDTH_RATIO: float = 0.8       # estimated text width = height * this
+TEXT_THICKNESS_RATIO: float = 0.1667  # estimated text stroke thickness = height * this
+
 
 def nums(line):
     return list(map(int, re.findall(r'-?\d+', line)))
@@ -377,8 +389,8 @@ class DDFConverter:
         n_x        = (n[4] if n[4] <= 32768 else n[4] - 65536) + self.shapes[shape_id]['X']
         n_y        = (n[5] if n[5] <= 32768 else n[5] - 65536) + self.shapes[shape_id]['Y']
         n_h        = self.shapes[shape_id]['Height']
-        n_w        = int(n_h * 0.8)
-        n_t        = int(n_h / 6)
+        n_w        = int(n_h * TEXT_WIDTH_RATIO)
+        n_t        = int(n_h * TEXT_THICKNESS_RATIO)
         n_rot      = ROT_MAP.get(self.shapes[shape_id]['Rot'], 0)
         shape_name = self.shapes[shape_id]['name']
 

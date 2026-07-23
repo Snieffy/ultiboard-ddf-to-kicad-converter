@@ -37,12 +37,12 @@ def _load_kiub() -> Any:
     definitions have been registered, and before any file I/O takes place.
     """
     gui_dir   = Path(__file__).parent
-    kiub_path = gui_dir / "KIUB.py"
+    kiub_path = gui_dir / "kiub.py"
     if not kiub_path.exists():
         messagebox.showerror(
             "KIUB not found",
-            f"Cannot find KIUB.py in:\n{gui_dir}\n\n"
-            "Place KIUB_gui.py in the same folder as KIUB.py.",
+            f"Cannot find kiub.py in:\n{gui_dir}\n\n"
+            "Place kiub_gui.py in the same folder as kiub.py.",
         )
         sys.exit(1)
 
@@ -124,6 +124,314 @@ def _save_kicad_exe(path: str) -> None:
         cfg.write(f)
 
 
+# ---------------------------------------------------------------------------
+# Board-defaults config (persisted alongside the KiCad path, same ini file).
+# Mirrors KIUC's [tuning] section / kiuc.ini pattern (kiuc_gui.py).
+# ---------------------------------------------------------------------------
+
+_BOARD_DEFAULTS_SECTION = "board_defaults"
+
+
+def _load_board_defaults() -> dict:
+    """Load saved board-default values from kiub_gui.ini. Any name not
+    present in the file (fresh install, or a newly-added default) is simply
+    left out, so the caller should overlay this onto KIUB.BOARD_DEFAULTS_SPEC's
+    built-in defaults rather than assume every key is present."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    values = {}
+    if cfg.has_section(_BOARD_DEFAULTS_SECTION):
+        for name, _default, _lo, _hi, _desc, _target in KIUB.BOARD_DEFAULTS_SPEC:
+            if cfg.has_option(_BOARD_DEFAULTS_SECTION, name):
+                try:
+                    values[name] = cfg.getfloat(_BOARD_DEFAULTS_SECTION, name)
+                except ValueError:
+                    pass   # corrupted entry; fall back to current default
+    return values
+
+
+def _save_board_defaults(values: dict) -> None:
+    """Persist board-default values to the config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    if not cfg.has_section(_BOARD_DEFAULTS_SECTION):
+        cfg.add_section(_BOARD_DEFAULTS_SECTION)
+    for name, value in values.items():
+        cfg.set(_BOARD_DEFAULTS_SECTION, name, repr(value))
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+class _BoardDefaultsDialog(tk.Toplevel):
+    """Fine-tuning pop-up for the editable board defaults (kicad_pcb "setup"
+    section + kicad_pro "rules" section). Fields are generated entirely from
+    KIUB.BOARD_DEFAULTS_SPEC -- adding a new tunable there is all that's
+    needed for it to appear here; no layout changes required. Mirrors
+    KIUC's own _TuningDialog (kiuc_gui.py) so both tools share the same UX.
+
+    Always opened on the main thread (button command), so no thread-safety
+    concerns.
+    """
+
+    def __init__(self, parent: tk.Tk, current: dict) -> None:
+        super().__init__(parent)
+        self.title("Board defaults")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.saved = False
+        self.result: dict = {}
+
+        self._specs = {name: (default, lo, hi, desc, target)
+                       for name, default, lo, hi, desc, target in KIUB.BOARD_DEFAULTS_SPEC}
+        self._vars: dict[str, tk.StringVar] = {}
+
+        ttk.Label(
+            self,
+            text="These values are written into the converted kicad_pcb's "
+                 "(setup) section and/or the kicad_pro's design rules. "
+                 "Changes apply to the next conversion and are saved to "
+                 "kiub_gui.ini.",
+            wraplength=480, justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 8))
+
+        row = 1
+        for name, default, lo, hi, desc, target in KIUB.BOARD_DEFAULTS_SPEC:
+            ttk.Label(self, text=name, font=("Consolas", 9, "bold")).grid(
+                row=row, column=0, sticky="nw", padx=(12, 6), pady=(6, 0))
+
+            var = tk.StringVar(value=str(current.get(name, default)))
+            self._vars[name] = var
+            ttk.Entry(self, textvariable=var, width=10, font=("Consolas", 9)).grid(
+                row=row, column=1, sticky="nw", pady=(6, 0))
+
+            ttk.Label(self, text=f"(default {default}, {target})",
+                     foreground="#888").grid(row=row, column=2, sticky="nw",
+                                             padx=(6, 12), pady=(6, 0))
+            row += 1
+            ttk.Label(self, text=f"{desc} (suggested range {lo}\u2013{hi})",
+                     wraplength=480, justify="left",
+                     foreground="#555").grid(
+                row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+            row += 1
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 0))
+        row += 1
+
+        frm_btns = ttk.Frame(self)
+        frm_btns.grid(row=row, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 12))
+        ttk.Button(frm_btns, text="Reset to defaults",
+                  command=self._on_reset).pack(side="left")
+        ttk.Button(frm_btns, text="Cancel",
+                  command=self._on_cancel).pack(side="right")
+        ttk.Button(frm_btns, text="Save",
+                  command=self._on_save).pack(side="right", padx=8)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.grab_set()
+
+    def _on_reset(self) -> None:
+        for name, (default, _lo, _hi, _desc, _target) in self._specs.items():
+            self._vars[name].set(str(default))
+
+    def _on_save(self) -> None:
+        values = {}
+        for name, (default, lo, hi, _desc, _target) in self._specs.items():
+            raw = self._vars[name].get().strip()
+            try:
+                v = float(raw)
+            except ValueError:
+                messagebox.showerror("Invalid value",
+                    f'{name}: "{raw}" is not a number.', parent=self)
+                return
+            if not (lo <= v <= hi):
+                ok = messagebox.askyesno("Value out of suggested range",
+                    f"{name} = {v} is outside the suggested range "
+                    f"{lo}\u2013{hi} (default {default}).\n\nUse it anyway?",
+                    parent=self)
+                if not ok:
+                    return
+            values[name] = v
+
+        self.result = values
+        self.saved = True
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Fine-tuning config (persisted alongside the KiCad path / board defaults,
+# same ini file). Kept in a SEPARATE dialog/section from board_defaults so
+# sensitive DRC-adjacent settings aren't mixed in with generic ones.
+# Mirrors KIUC's [tuning] section / kiuc.ini pattern (kiuc_gui.py).
+# ---------------------------------------------------------------------------
+
+_FINE_TUNING_SECTION = "fine_tuning"
+
+
+def _load_fine_tuning() -> dict:
+    """Load saved fine-tuning values from kiub_gui.ini. Any name not
+    present in the file (fresh install, or a newly-added tunable) is simply
+    left out, so the caller should overlay this onto KIUB.FINE_TUNING_SPEC's
+    built-in defaults rather than assume every key is present."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    values = {}
+    if cfg.has_section(_FINE_TUNING_SECTION):
+        for name, _default, _lo, _hi, _desc, _category in KIUB.FINE_TUNING_SPEC:
+            if cfg.has_option(_FINE_TUNING_SECTION, name):
+                try:
+                    values[name] = cfg.getfloat(_FINE_TUNING_SECTION, name)
+                except ValueError:
+                    pass   # corrupted entry; fall back to current default
+    return values
+
+
+def _save_fine_tuning(values: dict) -> None:
+    """Persist fine-tuning values to the config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    if not cfg.has_section(_FINE_TUNING_SECTION):
+        cfg.add_section(_FINE_TUNING_SECTION)
+    for name, value in values.items():
+        cfg.set(_FINE_TUNING_SECTION, name, repr(value))
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+class _FineTuningDialog(tk.Toplevel):
+    """Fine-tuning pop-up for geometry/style constants and cautious DRC-
+    adjacent fallback defaults. Fields are generated entirely from
+    KIUB.FINE_TUNING_SPEC -- adding a new tunable there is all that's needed
+    for it to appear here; no layout changes required.
+
+    Kept as a SEPARATE dialog from "Board defaults…" (which only holds true
+    manufacturing clearances written straight into kicad_pcb/kicad_pro) so
+    these more sensitive/empirical settings don't get mixed in with generic
+    ones. Entries are grouped by their 'category' tag: 'geometry' (visual/
+    rendering fit, safe to adjust freely) and 'clearance' (DRC-adjacent
+    fallback values, alter cautiously). Mirrors KIUC's own _TuningDialog
+    (kiuc_gui.py) almost exactly, including its category-grouping approach.
+
+    Always opened on the main thread (button command), so no thread-safety
+    concerns.
+    """
+
+    _SECTION_INTRO = {
+        'geometry':  "These affect how converted geometry looks (text size, "
+                     "line widths, outline snapping). Safe to adjust for "
+                     "visual fit against KiCad's rendering -- they don't "
+                     "affect manufacturability or DRC.",
+        'clearance': "These are fallback copper clearances/widths used only "
+                     "where the DDF doesn't specify a value of its own. "
+                     "Alter cautiously -- values set too aggressively can "
+                     "trigger DRC clearance violations elsewhere on the "
+                     "board.",
+    }
+    _SECTION_TITLE = {
+        'geometry':  'Geometry / visual fit',
+        'clearance': 'Fallback clearances (DRC-adjacent -- alter cautiously)',
+    }
+
+    def __init__(self, parent: tk.Tk, current: dict) -> None:
+        super().__init__(parent)
+        self.title("Fine-tuning")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.saved = False
+        self.result: dict = {}
+
+        self._specs = {name: (default, lo, hi, desc, category)
+                       for name, default, lo, hi, desc, category in KIUB.FINE_TUNING_SPEC}
+        self._vars: dict[str, tk.StringVar] = {}
+
+        by_category: dict[str, list] = {}
+        for entry in KIUB.FINE_TUNING_SPEC:
+            by_category.setdefault(entry[5], []).append(entry)
+
+        row = 0
+        for category in ('geometry', 'clearance'):
+            entries = by_category.get(category)
+            if not entries:
+                continue
+
+            ttk.Label(self, text=self._SECTION_TITLE.get(category, category),
+                     font=("Segoe UI", 10, "bold")).grid(
+                row=row, column=0, columnspan=3, sticky="w",
+                padx=12, pady=(12, 2))
+            row += 1
+            ttk.Label(self, text=self._SECTION_INTRO.get(category, ''),
+                     wraplength=480, justify="left").grid(
+                row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 8))
+            row += 1
+
+            for name, default, lo, hi, desc, _category in entries:
+                ttk.Label(self, text=name, font=("Consolas", 9, "bold")).grid(
+                    row=row, column=0, sticky="nw", padx=(12, 6), pady=(6, 0))
+
+                var = tk.StringVar(value=str(current.get(name, default)))
+                self._vars[name] = var
+                ttk.Entry(self, textvariable=var, width=10, font=("Consolas", 9)).grid(
+                    row=row, column=1, sticky="nw", pady=(6, 0))
+
+                ttk.Label(self, text=f"(default {default}, range {lo}\u2013{hi})",
+                         foreground="#888").grid(row=row, column=2, sticky="nw",
+                                                 padx=(6, 12), pady=(6, 0))
+                row += 1
+                ttk.Label(self, text=desc, wraplength=480, justify="left",
+                         foreground="#555").grid(
+                    row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+                row += 1
+
+            ttk.Separator(self, orient="horizontal").grid(
+                row=row, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 0))
+            row += 1
+
+        frm_btns = ttk.Frame(self)
+        frm_btns.grid(row=row, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 12))
+        ttk.Button(frm_btns, text="Reset to defaults",
+                  command=self._on_reset).pack(side="left")
+        ttk.Button(frm_btns, text="Cancel",
+                  command=self._on_cancel).pack(side="right")
+        ttk.Button(frm_btns, text="Save",
+                  command=self._on_save).pack(side="right", padx=8)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.grab_set()
+
+    def _on_reset(self) -> None:
+        for name, (default, _lo, _hi, _desc, _category) in self._specs.items():
+            self._vars[name].set(str(default))
+
+    def _on_save(self) -> None:
+        values = {}
+        for name, (default, lo, hi, _desc, _category) in self._specs.items():
+            raw = self._vars[name].get().strip()
+            try:
+                v = float(raw)
+            except ValueError:
+                messagebox.showerror("Invalid value",
+                    f'{name}: "{raw}" is not a number.', parent=self)
+                return
+            if not (lo <= v <= hi):
+                ok = messagebox.askyesno("Value out of suggested range",
+                    f"{name} = {v} is outside the suggested range "
+                    f"{lo}\u2013{hi} (default {default}).\n\nUse it anyway?",
+                    parent=self)
+                if not ok:
+                    return
+            values[name] = v
+
+        self.result = values
+        self.saved = True
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.destroy()
+
+
 def _browse_kicad_exe(parent: tk.Misc | None = None) -> str:
     """
     Open a file-browser so the user can locate the KiCad executable.
@@ -193,7 +501,7 @@ class KiubApp(tk.Tk):
         super().__init__()
         self.title("KIUB  –  Ultiboard DDF → KiCad PCB Converter")
         self.resizable(True, True)
-        self.minsize(680, 540)
+        self.minsize(760, 540)
 
         self._log_queue:    queue.Queue[str] = queue.Queue()
         self._running:      bool             = False
@@ -203,6 +511,24 @@ class KiubApp(tk.Tk):
         self._font_var:     tk.StringVar     = tk.StringVar(value=self._DEFAULT_FONT)
         self._verbose_var:  tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
         self._mono_var:     tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
+
+        # Editable board defaults (kicad_pcb "setup" section + kicad_pro
+        # "rules" section). Loaded from kiub_gui.ini, overlaid onto
+        # KIUB.BOARD_DEFAULTS_SPEC's built-in defaults; edited via the
+        # "Board defaults…" dialog, not inline fields.
+        self._board_defaults: dict[str, float] = {
+            name: default for name, default, *_ in KIUB.BOARD_DEFAULTS_SPEC
+        }
+        self._board_defaults.update(_load_board_defaults())
+
+        # Editable fine-tuning constants (geometry/visual fit + cautious
+        # DRC-adjacent fallback clearances). Loaded from kiub_gui.ini,
+        # overlaid onto KIUB.FINE_TUNING_SPEC's built-in defaults; edited
+        # via the separate "Fine-tuning…" dialog.
+        self._fine_tuning: dict[str, float] = {
+            name: default for name, default, *_ in KIUB.FINE_TUNING_SPEC
+        }
+        self._fine_tuning.update(_load_fine_tuning())
 
         # KiCad launcher state
         self._kicad_exe:    str = _load_kicad_exe()   # '' until confirmed valid
@@ -349,7 +675,7 @@ class KiubApp(tk.Tk):
         ).grid(row=4, column=2, sticky=tk.W, padx=(6, 0), pady=(0, 8))
 
         # ── Action buttons ───────────────────────────────────────────────────
-        # Layout (left → right): ▶ Start Conversion | Open in KiCad | Clear Log | ⚙ KiCad Path…
+        # Layout (left → right): ▶ Start Conversion | Open in KiCad | Clear Log | ⚙ Board defaults… | ⚙ Fine-tuning… | ⚙ KiCad Path…
         btn_frame = ttk.Frame(outer)
         btn_frame.grid(row=5, column=0, columnspan=3, pady=(0, 8))
 
@@ -366,6 +692,12 @@ class KiubApp(tk.Tk):
 
         ttk.Button(btn_frame, text="Clear Log",
                    command=self._clear_log, width=12).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(btn_frame, text="⚙  Board defaults…",
+                   command=self._open_board_defaults_dialog, width=18).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(btn_frame, text="⚙  Fine-tuning…",
+                   command=self._open_fine_tuning_dialog, width=16).pack(side=tk.LEFT, padx=(0, 10))
 
         ttk.Button(btn_frame, text="⚙  KiCad Path…",
                    command=self._change_kicad_exe, width=16).pack(side=tk.LEFT)
@@ -466,7 +798,54 @@ class KiubApp(tk.Tk):
         return argparse.Namespace(
             infile=infile, outfile=outfile, font=font,
             verbose=self._verbose_var.get(),
+            **self._board_defaults,
+            **self._fine_tuning,
         )
+
+    def _check_refdes_prescan(self, infile: str) -> bool:
+        """Pre-scan the DDF for non-digit-ending reference designators and,
+        if any are found, pop up a list and ask whether to continue or
+        abort. Returns True to proceed, False to abort. Read-only: does not
+        rename or modify anything (see kiub.scan_non_digit_refdes).
+        """
+        try:
+            ddf_handle = KIUB.open_ddf(infile, verbose=False)
+            try:
+                ddf_text = ddf_handle.read().decode("CP437", errors="replace")
+            finally:
+                ddf_handle.close()
+        except Exception:
+            # If the pre-scan itself fails for any reason, don't block the
+            # conversion on it -- the real converter will surface any
+            # genuine problem with the file.
+            return True
+
+        offending = KIUB.scan_non_digit_refdes(ddf_text)
+        if not offending:
+            return True
+
+        sibling = KIUB.find_sibling_schematic(infile)
+        msg = ("The following component reference designators do not end "
+               "in a digit:\n\n  " + "\n  ".join(offending) + "\n\n")
+        if sibling:
+            msg += (f"A sibling schematic was found:\n  {sibling}\n\n"
+                     "Run KIUC's Refdes Reannotate tool FIRST, before changing "
+                     "any of these references -- it is what keeps the "
+                     "schematic and PCB in sync. Renaming them directly (in "
+                     "the PCB or the schematic alone) will break that "
+                     "sync.\n\n")
+        else:
+            msg += ("No sibling schematic (.SCH/.kicad_sch) was found next "
+                     "to this DDF.\n\n"
+                     "KiCad's PCB editor accepts non-digit-ending references "
+                     "without issue, so no action is needed if this board "
+                     "has no schematic. If a schematic for this board exists "
+                     "elsewhere, run KIUC's Refdes Reannotate tool first -- "
+                     "renaming these independently of that schematic will "
+                     "break their sync.\n\n")
+        msg += "Continue with the conversion anyway?"
+
+        return messagebox.askyesno("Non-digit-ending reference designators found", msg)
 
     def _start_conversion(self) -> None:
         if self._running:
@@ -475,6 +854,10 @@ class KiubApp(tk.Tk):
 
         args = self._build_args()
         if args is None:
+            return
+
+        if not self._check_refdes_prescan(args.infile):
+            self._status_var.set("Conversion cancelled.")
             return
 
         self._running = True
@@ -517,7 +900,7 @@ class KiubApp(tk.Tk):
             success  = False
             pro_path = ""
             try:
-                ddf_handle = KIUB.open_ddf(args.infile, verbose=args.verbose)
+                ddf_handle = KIUB.open_ddf(args.infile, verbose=args.verbose, args=args)
                 try:
                     with open(args.outfile, "w", encoding="utf-8", errors="replace") as kicad:
                         converter = Converter(ddf_handle, kicad, args)
@@ -661,6 +1044,24 @@ class KiubApp(tk.Tk):
             self._kicad_exe = path
             _save_kicad_exe(path)
             self._status_var.set(f"KiCad path saved: {path}")
+
+    def _open_board_defaults_dialog(self) -> None:
+        """Open the Board defaults pop-up."""
+        dlg = _BoardDefaultsDialog(self, self._board_defaults)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self._board_defaults.update(dlg.result)
+            _save_board_defaults(self._board_defaults)
+            self._status_var.set("Board defaults saved.")
+
+    def _open_fine_tuning_dialog(self) -> None:
+        """Open the separate Fine-tuning pop-up."""
+        dlg = _FineTuningDialog(self, self._fine_tuning)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self._fine_tuning.update(dlg.result)
+            _save_fine_tuning(self._fine_tuning)
+            self._status_var.set("Fine-tuning values saved.")
 
     def _open_in_kicad(self) -> None:
         """Launch KiCad with the last converted .kicad_pro file."""
