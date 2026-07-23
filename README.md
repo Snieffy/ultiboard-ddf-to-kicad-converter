@@ -7,7 +7,9 @@ This is an independent, open-source project and is not affiliated with, sponsore
 [KiCad](https://www.kicad.org/) is a free software suite for electronic design automation.\
 This tool is provided "as-is" for file migration purposes only.
 
-This is a high-fidelity converter designed to migrate legacy **Ultiboard DDF** (`.ddf`) files into modern **KiCad PCB** (`.kicad_pcb`) projects. 
+This is a high-fidelity converter designed to migrate legacy **Ultiboard DDF** (`.ddf`) files into modern **KiCad PCB** (`.kicad_pcb`) projects.\
+It is the PCB counterpart to [KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter),
+which converts Ulticap schematic files to KiCad schematic format.
 
 ---
 
