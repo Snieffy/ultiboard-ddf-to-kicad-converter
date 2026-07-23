@@ -81,8 +81,12 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > - Font selection.
 > - Open in KiCAD button (user selectable Kicad PCB executable path).
 > - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
+> - Adjustable geometry and clearance settings in 'Board defaults' and 'Fine-tuning'. Alter these cautiously as these 
 
 ![Ultiboard to KiCad GUI](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI.png)
+![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Board-defaults.png).
+![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Fine-tuning.png).
+
 
 ---
 
@@ -105,12 +109,6 @@ DDF design in Kicad, small differences still are possible.
   While the design data is accurate, KiCad will perform a one-time update
   of the S-expression notation when the file is first opened.
 - Automatic creation of a .kicad_pro file with settings obtained from the DDF file.
-- Making it a Kicad plugin would complete the project.
-
-Work in progress:
-- Creation of a font that exactly replicates Ultiboard characters
-  (Ultiboard uses an internally generated font).
-- An Ulticap to Kicad schematic converter (currently in a study stage).
 
 Erratum Ultiboard Reference Manual 
 ----------------------------------
@@ -277,6 +275,7 @@ Erratum DDF file structure
   the Ultiboard characters and their size.
   ** Due to the use of a different font, small text misalignments will occur.
 - A default minimum solder mask width is specified in the Header (solder_mask_min_width 0.15).
+  Tunable in the 'Board defaults' menu.
 - Shapes    Backup shapes (ending with .BAK) are ignored.
 - Polygons  Only polygon outlines are copied to the Kicad file.
             As a result, the polygons (zones in Kicad) need to be rebuilt:
