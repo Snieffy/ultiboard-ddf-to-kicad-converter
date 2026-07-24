@@ -491,7 +491,7 @@ def calc_arc_points(
     radius: float,
     start_angle_deg: float,
     span_deg: float,
-    accuracy: int = 6,
+    accuracy: int | None = None,
 ) -> tuple[Point2D, Point2D, Point2D]:
     """Return centre-relative (x, y) offsets for the start, mid-point, and
     end of an arc.
@@ -502,7 +502,15 @@ def calc_arc_points(
     start_angle_deg : arc start angle in degrees (DDF *arc1* value / 64)
     span_deg        : arc angular span in degrees (DDF *arc2* value / 64);
                       always positive
-    accuracy        : decimal places for rounding
+    accuracy        : decimal places for rounding. Defaults to None (full
+                      float precision) -- both call sites add this result to
+                      centre_x/centre_y (+ offsetX/offsetY for board-outline
+                      arcs) and round exactly once at that point (via _f() or
+                      the board-outline snap/degree-count logic), so rounding
+                      here as well would just be a redundant intermediate
+                      round. Kept as an explicit optional parameter, not
+                      removed, for the same reason as units_to_mm()'s
+                      *accuracy* argument.
 
     Returns
     -------
@@ -526,12 +534,15 @@ def calc_arc_points(
     ub_mid   = -(ub_start + span_deg / 2)   # always ≤ 0; no wrap-around check needed
     ub_end   = (ub_start + span_deg) % 360
 
-    start_pt: Point2D = (round(radius * math.cos(deg_to_rad * ub_start), accuracy),
-                         round(radius * math.sin(deg_to_rad * ub_start), accuracy))
-    mid_pt: Point2D   = (round(radius * math.cos(deg_to_rad * ub_mid),   accuracy),
-                         round(radius * math.sin(deg_to_rad * ub_mid),   accuracy))
-    end_pt: Point2D   = (round(radius * math.cos(deg_to_rad * ub_end),   accuracy),
-                         round(radius * math.sin(deg_to_rad * ub_end),   accuracy))
+    def _r(val: float) -> float:
+        return round(val, accuracy) if accuracy is not None else val
+
+    start_pt: Point2D = (_r(radius * math.cos(deg_to_rad * ub_start)),
+                         _r(radius * math.sin(deg_to_rad * ub_start)))
+    mid_pt: Point2D   = (_r(radius * math.cos(deg_to_rad * ub_mid)),
+                         _r(radius * math.sin(deg_to_rad * ub_mid)))
+    end_pt: Point2D   = (_r(radius * math.cos(deg_to_rad * ub_end)),
+                         _r(radius * math.sin(deg_to_rad * ub_end)))
 
     return start_pt, mid_pt, end_pt
 
@@ -654,14 +665,25 @@ class Converter:
     def units_to_mm(self, val: int | float, accuracy: int | None = None) -> float:
         """Convert DDF database units to mm.
 
-        NOTE: accuracy defaults to self.di_Ac rather than being fixed at
-        definition time, because di_Ac is updated when the header is read.
+        Returns full float precision unless *accuracy* is explicitly given.
+        Rounding by default here was the main source of compounding rounding
+        error throughout the file: a value rounded at conversion time, then
+        combined with other already-rounded values (offsetX/offsetY, ratios,
+        etc.), accumulates noise beyond what a single final rounding would
+        produce. Callers are expected to round exactly once, at their own
+        terminal output point (via _f() or an explicit round()) -- not here.
+
+        The two call sites that do pass an explicit accuracy (drill
+        diameters, rounded to dr_Ac) are a deliberate exception: that
+        rounding IS the final, intended precision for those values, matching
+        KiCad's own 2-decimal drill-size convention, and those values are
+        written to the file without any further rounding step.
         """
-        if accuracy is None:
-            accuracy = self.di_Ac
         if self.DDF_major == '4':
-            return round((val / 1.2) * 0.0254, accuracy)   # 1/1200 inch
-        return round(val / 1_000_000, accuracy)             # nanometres
+            val_mm = (val / 1.2) * 0.0254   # 1/1200 inch
+        else:
+            val_mm = val / 1_000_000         # nanometres
+        return round(val_mm, accuracy) if accuracy is not None else val_mm
 
     def _f(self, val: float) -> str:
         """Round val to di_Ac decimal places and return as a string.
@@ -756,8 +778,8 @@ class Converter:
                 frame_center = (sw / 2, (sh - 45) / 2 + 7.5)
                 break
 
-        self.offsetX   = round(frame_center[0] - board_center[0], self.di_Ac)  # Offset to centre PCB on frame.
-        self.offsetY   = round(frame_center[1] - board_center[1], self.di_Ac)
+        self.offsetX   = frame_center[0] - board_center[0]  # Offset to centre PCB on frame.
+        self.offsetY   = frame_center[1] - board_center[1]
         maxLayers      = board_params[-1]   # Number of copper layers (always even, 2–32).
         self.layerMask = hex((2 ** maxLayers) - 1)
 
@@ -838,13 +860,13 @@ class Converter:
         sn_height = self.units_to_mm(lname[2])
         sn_rot    = lname[3] / 64
         sn_width  = self.units_to_mm(lname[4])
-        sn_thick  = round(lname[5] * sn_height / self.fontThickRatio, self.di_Ac)
+        sn_thick  = lname[5] * sn_height / self.fontThickRatio
 
         # Alias text descriptor: same field order as reference text
         lalias    = [int(i) for i in self._readline().split()]
         sa_height = self.units_to_mm(lalias[2])
         sa_width  = self.units_to_mm(lalias[4])
-        sa_thick  = round(lalias[5] * sa_height / self.fontThickRatio, self.di_Ac)
+        sa_thick  = lalias[5] * sa_height / self.fontThickRatio
 
         # Build the footprint template; {…} placeholders are filled per component.
         shapeStr = (
@@ -1027,7 +1049,7 @@ class Converter:
                     (dx_start, dy_start), \
                     (dx_mid,   dy_mid),   \
                     (dx_end,   dy_end)    = calc_arc_points(
-                        radius, start_angle, span_angle, self.di_Ac)
+                        radius, start_angle, span_angle)
                     if is_board:
                         # Store raw mm coordinates (without offset) for snapping.
                         board_arcs.append({
@@ -1293,8 +1315,8 @@ class Converter:
         """
         pi = [int(i) for i in line[4:].split(',')]
         pc_offsetX = (
-            0 if pi[1] == pi[2]                                             # Centric pads and SMD pads have no offset.
-            else round(self.units_to_mm(pi[2] - pi[1]) / 2, self.di_Ac)   # Pad-to-hole offset for non-centric pads.
+            0 if pi[1] == pi[2]                                     # Centric pads and SMD pads have no offset.
+            else self.units_to_mm(pi[2] - pi[1]) / 2                # Pad-to-hole offset for non-centric pads.
         )
         roundratio = (
             round(pi[4] / min(pi[1] + pi[2], pi[3]), self.di_Ac)   # Calculate pad corner rounding ratio.
@@ -1316,7 +1338,7 @@ class Converter:
         #   KiCad:            pads[0]=F.Cu,              pads[1]=Inner,             pads[2]=B.Cu
         ppos = int(line[2]) if int(line[2]) == 2 else abs(int(line[2]) - 1)
         self.pads[ppos].iloc[pi[0]] = [
-            round(pi[1] + pi[2], self.di_Ac),
+            pi[1] + pi[2],
             pi[3],
             pc_offsetX,
             roundratio,
@@ -1380,21 +1402,25 @@ class Converter:
         cxpos  = round(self.units_to_mm(int(carr[0])) + self.offsetX, self.di_Ac)
         cypos  = round(-self.units_to_mm(int(carr[1])) + self.offsetY, self.di_Ac)
         layerB = int(carr[2]) / 64 < 0   # Kept for speed and readability; equivalent to 'crot < 0'.
-        crot   = round(int(carr[2]) / 64, self.di_Ac)
+        crot_raw = int(carr[2]) / 64   # Kept unrounded: feeds cnrot/carot below as well as crot itself;
+                                        # each of the three rounds independently from this raw value.
+        crot   = round(crot_raw, self.di_Ac)
 
         cnxpos = round(-self.units_to_mm(int(carr[3])) if layerB else self.units_to_mm(int(carr[3])), self.di_Ac)
         cnypos = round(-self.units_to_mm(int(carr[4])), self.di_Ac)
-        cnrot  = round(int(carr[5]) / 64 + crot, self.di_Ac)
+        cnrot  = round(int(carr[5]) / 64 + crot_raw, self.di_Ac)
         cnwdth = round(self.units_to_mm(int(carr[6])), self.di_Ac)
-        cnhght = round(self.units_to_mm(int(carr[7])),  self.di_Ac)
-        cnthck = round(int(carr[8]) * cnhght / self.fontThickRatio, self.di_Ac)
+        cnhght_raw = self.units_to_mm(int(carr[7]))   # Kept unrounded: feeds cnthck below as well as cnhght itself.
+        cnhght = round(cnhght_raw, self.di_Ac)
+        cnthck = round(int(carr[8]) * cnhght_raw / self.fontThickRatio, self.di_Ac)
 
         caxpos = round(-self.units_to_mm(int(carr[9])) if layerB else self.units_to_mm(int(carr[9])), self.di_Ac)
         caypos = round(-self.units_to_mm(int(carr[10])), self.di_Ac)
-        carot  = round(int(carr[11]) / 64 + crot, self.di_Ac)
+        carot  = round(int(carr[11]) / 64 + crot_raw, self.di_Ac)
         cawdth = round(self.units_to_mm(int(carr[12])), self.di_Ac)
-        cahght = round(self.units_to_mm(int(carr[13])),  self.di_Ac)
-        cathck = round(int(carr[14]) * cahght / self.fontThickRatio, self.di_Ac)
+        cahght_raw = self.units_to_mm(int(carr[13]))   # Kept unrounded: feeds cathck below as well as cahght itself.
+        cahght = round(cahght_raw, self.di_Ac)
+        cathck = round(int(carr[14]) * cahght_raw / self.fontThickRatio, self.di_Ac)
 
         self.ddf.readline()  # <x-force_vect>,<y-force_vect>,<Temp case>,<Temp junc>,<power>,<Rth_junc_board>,0 – not used
 
@@ -1627,23 +1653,23 @@ class Converter:
                     case 4:     # north-east diagonal
                         half1 = (coord1 - coord2) / 2
                         half2 = (coord1 - coord3) / 2
-                        x1 = self._f(round(coord2 + half1, self.di_Ac) + self.offsetX)
-                        y1 = self._f(round(half1,           self.di_Ac) + self.offsetY)
-                        x2 = self._f(round(coord3 + half2, self.di_Ac) + self.offsetX)
-                        y2 = self._f(round(half2,           self.di_Ac) + self.offsetY)
+                        x1 = self._f(coord2 + half1 + self.offsetX)
+                        y1 = self._f(half1           + self.offsetY)
+                        x2 = self._f(coord3 + half2 + self.offsetX)
+                        y2 = self._f(half2           + self.offsetY)
                     case 8:     # south-east diagonal
                         half1 = (coord2 - coord1) / 2
                         half2 = (coord3 - coord1) / 2
-                        x1 = self._f(round(coord2 - half1, self.di_Ac) + self.offsetX)
-                        y1 = self._f(round(half1,           self.di_Ac) + self.offsetY)
-                        x2 = self._f(round(coord3 - half2, self.di_Ac) + self.offsetX)
-                        y2 = self._f(round(half2,           self.di_Ac) + self.offsetY)
+                        x1 = self._f(coord2 - half1 + self.offsetX)
+                        y1 = self._f(half1           + self.offsetY)
+                        x2 = self._f(coord3 - half2 + self.offsetX)
+                        y2 = self._f(half2           + self.offsetY)
 
                 self.kicad.write(
                     f'  (segment\n'
                     f'        (start {x1} {y1})\n'
                     f'        (end {x2} {y2})\n'
-                    f'        (width {width})\n'
+                    f'        (width {self._f(width)})\n'
                     f'        (layer "{tlayer}")\n'
                     f'        (net {netnr})\n'
                     f'  )\n'
@@ -1670,7 +1696,7 @@ class Converter:
             f' {self._f(-self.units_to_mm(vline[2]) + self.offsetY)})\n'
             f'        (end {self._f(self.units_to_mm(vline[3]) + self.offsetX)}'
             f' {self._f(-self.units_to_mm(vline[4]) + self.offsetY)})\n'
-            f'        (width {self.units_to_mm(self.traceWidth[vtcode])})\n'
+            f'        (width {self._f(self.units_to_mm(self.traceWidth[vtcode]))})\n'
             f'        (layer "{vlayer}")\n'
             f'        (net {vnetnr})\n'
             f'  )\n'
@@ -1701,7 +1727,7 @@ class Converter:
 
         (dx_start, dy_start), \
         (dx_mid,   dy_mid),   \
-        (dx_end,   dy_end)    = calc_arc_points(radius, start_angle, span_angle, self.di_Ac)
+        (dx_end,   dy_end)    = calc_arc_points(radius, start_angle, span_angle)
 
         self.kicad.write(
             f'  (arc\n'
@@ -1711,7 +1737,7 @@ class Converter:
             f' {self._f(-(centre_y - dy_mid)   + self.offsetY)})\n'
             f'        (end   {self._f(centre_x + dx_end   + self.offsetX)}'
             f' {self._f(-(centre_y + dy_end)   + self.offsetY)})\n'
-            f'        (width {atWidth})\n'
+            f'        (width {self._f(atWidth)})\n'
             f'        (layer "{alayer}")\n'
             f'        (net {anetnr})\n'
             f'  )\n'
@@ -1725,15 +1751,15 @@ class Converter:
         lppat   = lpline[2]
         lpdist  = lpline[3] - self.traceWidth[lpline[4]]  # Hatch gap: Ultiboard stores centre-to-centre
         lptcode = lpline[4]                                #   distance; KiCad needs gap = c-to-c minus trace width.
-        lpclear = self.units_to_mm(lpline[5])
-        width   = self.units_to_mm(self.traceWidth[lptcode])
+        lpclear = self._f(self.units_to_mm(lpline[5]))
+        width   = self._f(self.units_to_mm(self.traceWidth[lptcode]))
 
         if lppat in (3, 12):
             # Hatch fill: code 3 = 0°, code 12 = 45° → angle = (code−3) × 5
             lpHatch = (
                 f'                (mode hatch)\n'
-                f'                (hatch_thickness {self.units_to_mm(self.traceWidth[lptcode])})\n'
-                f'                (hatch_gap {self.units_to_mm(lpdist)})\n'
+                f'                (hatch_thickness {width})\n'
+                f'                (hatch_gap {self._f(self.units_to_mm(lpdist))})\n'
                 f'                (hatch_orientation {(lppat - 3) * 5})\n'
             )
         else:
@@ -1844,9 +1870,12 @@ class Converter:
         xfields  = line[3:].split(None, 7)[:7]
         text_x   = round(self.units_to_mm(int(xfields[0])) + self.offsetX, self.di_Ac)
         text_y   = round(-self.units_to_mm(int(xfields[1])) + self.offsetY, self.di_Ac)
-        text_h   = round(self.units_to_mm(int(xfields[2])) / self.fontHeightRatio, self.di_Ac)  # Empirical scale.
+        text_h_raw = self.units_to_mm(int(xfields[2])) / self.fontHeightRatio  # Empirical scale; kept
+                                                                                 # unrounded: feeds text_t below
+                                                                                 # as well as text_h itself.
+        text_h   = round(text_h_raw, self.di_Ac)
         text_w   = round(self.units_to_mm(int(xfields[3])) * self.fontWidthRatio,  self.di_Ac)
-        text_t   = round(int(xfields[4]) * text_h / self.fontThickRatio, self.di_Ac)
+        text_t   = round(int(xfields[4]) * text_h_raw / self.fontThickRatio, self.di_Ac)
         text_bot = int(xfields[5]) / 64 < 0
         text_rot = int(xfields[5]) / 64
         text_lay = int(xfields[6])
@@ -1888,14 +1917,14 @@ class Converter:
                 f'        (net {pwr_net})\n'
                 f'        (net_name "{self.nets[pwr_net]}")\n'
                 f'        (layer "{pwr_layer}")\n'
-                f'        (hatch edge {self.defaultWidth})\n'
+                f'        (hatch edge {self._f(self.defaultWidth)})\n'
                 f'        (connect_pads\n'
-                f'                (clearance {self.boardClearance})\n'
+                f'                (clearance {self._f(self.boardClearance)})\n'
                 f'        )\n'
-                f'        (min_thickness {self.defaultWidth})\n'
+                f'        (min_thickness {self._f(self.defaultWidth)})\n'
                 f'        (fill yes\n'
-                f'                (thermal_gap {self.defaultThermalGap})\n'
-                f'                (thermal_bridge_width {self.defaultThermalWidth})\n'
+                f'                (thermal_gap {self._f(self.defaultThermalGap)})\n'
+                f'                (thermal_bridge_width {self._f(self.defaultThermalWidth)})\n'
                 f'        )\n'
                 f'        (polygon\n'
                 f'            (pts\n'
@@ -2134,7 +2163,7 @@ class Converter:
                         "max_error":                      0.005,
                         "min_clearance":                  min_trace_clearance,
                         "min_connection":                 0.0,
-                        "min_copper_edge_clearance":      self.boardClearance,
+                        "min_copper_edge_clearance":      round(self.boardClearance, self.di_Ac),
                         "min_groove_width":               0.0,
                         "min_hole_clearance":             min_pad_clearance,
                         "min_hole_to_hole":               min_through_hole,
