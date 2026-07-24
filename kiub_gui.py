@@ -506,6 +506,12 @@ class KiubApp(tk.Tk):
         self._log_queue:    queue.Queue[str] = queue.Queue()
         self._running:      bool             = False
         self._out_dir_var:  tk.StringVar     = tk.StringVar()
+        # Whether the output folder should keep following the input file's
+        # own folder as new DDF files are selected. Turns off as soon as the
+        # user explicitly sets a folder (Browse… or typing); clearing the
+        # field back to empty turns it on again. See _on_outdir_changed.
+        self._out_dir_auto: bool = True
+        self._suppress_outdir_trace: bool = False
         self._infile_var:   tk.StringVar     = tk.StringVar()
         self._outfile_var:  tk.StringVar     = tk.StringVar()
         self._font_var:     tk.StringVar     = tk.StringVar(value=self._DEFAULT_FONT)
@@ -621,7 +627,7 @@ class KiubApp(tk.Tk):
 
         ttk.Entry(outdir_frame, textvariable=self._out_dir_var,
                   font=self._ENTRY_FONT).grid(row=0, column=0, sticky=tk.EW, padx=(0, 6))
-        self._out_dir_var.trace_add("write", lambda *_: self._refresh_outfile_path())
+        self._out_dir_var.trace_add("write", self._on_outdir_changed)
 
         ttk.Button(outdir_frame, text="Browse…",
                    command=self._browse_outdir).grid(row=0, column=1)
@@ -753,12 +759,41 @@ class KiubApp(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _on_infile_changed(self, *_: Any) -> None:
-        """When the input file changes, auto-fill the output folder and filename."""
+        """When the input file changes, auto-fill the output folder and filename.
+
+        The output folder keeps following the input file's own folder for as
+        long as the user hasn't explicitly chosen one of their own (see
+        _on_outdir_changed) -- previously this only happened once, ever, the
+        very first time an input file was picked, so selecting a second DDF
+        from a different folder left the output folder stuck on the first
+        one.
+        """
         infile = self._infile_var.get().strip()
         if not infile:
             return
-        if not self._out_dir_var.get():
-            self._out_dir_var.set(str(Path(infile).parent))
+        if self._out_dir_auto:
+            self._suppress_outdir_trace = True
+            try:
+                self._out_dir_var.set(str(Path(infile).parent))
+            finally:
+                self._suppress_outdir_trace = False
+        self._refresh_outfile_path()
+
+    def _on_outdir_changed(self, *_: Any) -> None:
+        """Track whether the output folder is user-chosen or should keep
+        auto-following the input file, then refresh the full output path.
+
+        Skipped while _suppress_outdir_trace is set, i.e. while
+        _on_infile_changed itself is the one updating this field -- that's
+        an auto-follow update, not a user override, and must not turn
+        auto-follow back off.
+        """
+        if not self._suppress_outdir_trace:
+            # User typed in the field, used Browse…, or cleared it.
+            # Clearing it back to empty resumes auto-follow; anything else
+            # (including Browse…, which goes through this same trace) is an
+            # explicit choice that should stick across future input files.
+            self._out_dir_auto = not self._out_dir_var.get().strip()
         self._refresh_outfile_path()
 
     def _refresh_outfile_path(self) -> None:
