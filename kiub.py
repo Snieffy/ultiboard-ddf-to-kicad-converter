@@ -217,7 +217,7 @@ ub_fontmap: dict[bytes, str] = {
 #         Edge.Cuts=44, Margin=45, B.CrtYd=46, F.CrtYd=47,
 #         B.Fab=48, F.Fab=49, User.1=50..User.4=53
 HEADER_TEMPLATE: str = """\
-(kicad_pcb (version 20241029) (generator "KIUB") (generator_version "1.1.0")
+(kicad_pcb (version 20241229) (generator "KIUB") (generator_version "1.1.0")
 
   (general
     (thickness {board_thickness})
