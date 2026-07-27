@@ -35,6 +35,14 @@ import os
 import re
 import sys
 
+# V2/V3 rotation code (0-7) -> V4.60 signed degrees*64 value.
+# Side and angle share one small code: 0-3 = top layer, 4-7 = bottom layer
+# (sign of the resulting value is what actually signals "bottom" downstream,
+# see kiub.py's *C/*X handling). NOT a simple code*90 progression on either
+# half -- confirmed against Ultiboard V5/V5.72 directly (opening a test
+# board built with one shape per rotation code):
+#   top    (codes 0-3): 0 deg, 270 deg, 180 deg,  90 deg  (angle runs BACKWARDS)
+#   bottom (codes 4-7): 0 deg,  90 deg, 180 deg, 270 deg  (angle runs FORWARDS)
 ROT_MAP = {
     0: 0, 1: 17280, 2: 11520, 3: 5760,
     4: -23040, 5: -5760, 6: -11520, 7: -17280
@@ -113,16 +121,34 @@ class DDFConverter:
         header = self.lines[self.i].strip()
         self.i += 1
 
-        self.i += 1  # skip version line
+        self.i += 1  # skip version line -- major/minor is only used upstream
+                      # (kiub.py's open_ddf) to decide whether to invoke this
+                      # pre-converter at all; its content is discarded here
+                      # and replaced unconditionally with "4 60" below.
 
         dims = self.lines[self.i].strip()
         self.i += 1
 
+        # V2/V3's own bounds line is "<width>, <height>, <grid>, <field4>;"
+        # (NOT a pair of outline corners like V4/V5's own bounds line) --
+        # only the first two fields (board width/height, in the same
+        # database-unit system as everything else) are used. <grid> and
+        # <field4> are read here via the same regex but never assigned,
+        # since kiub.py itself never reads either field back out.
         n = nums(dims)
         self.board_w, self.board_h = n[0], n[1]
 
         self.out.append(header)
         self.out.append("4 60")
+        # Everything from here down is fabricated: V2/V3 has no outline
+        # corners, layer-lamination string, reference point, router
+        # options, layer-direction flags, or power-plane data at all, and
+        # kiub.py itself never reads any of these fields back out (they
+        # only exist to satisfy V4/V5's fixed header grammar). The one
+        # field worth a comment is the hardcoded max-layer count of 22:
+        # unlike the rest, this one IS meaningful -- it's the documented
+        # maximum layer count for the V2/V3 format per the Ultiboard
+        # reference manual, not an arbitrary filler value.
         self.out.append(f"{self.board_w}, {self.board_h}, 0, 0, 6, 0, 22;")
         self.out.append("(|+|+|+|+|+|+|+|+|+|+|)")
         self.out.append("0, 0")
@@ -167,10 +193,28 @@ class DDFConverter:
             # -------------------------
             if rec in ("TP", "TT", "TC"):
                 if line.startswith("*TP"):
+                    # V2/V3's own *TP value (e.g. "fffff000") is discarded
+                    # and replaced unconditionally -- kiub.py never reads
+                    # this field back out either way.
                     line = '*TP ffffffff'
                 if line.startswith("*TC"):
+                    # V2/V3 only ever defines trace codes 0-15; V4/V5's own
+                    # table spans 0-31 (kiub.py's TT handler). Backfill the
+                    # upper half with a harmless default so a standalone
+                    # V2v3-converted file opened directly in Ultiboard V5
+                    # (not just fed to kiub.py) has a defined entry for
+                    # every code it might reference.
                     for r in range(16, 32):
                         self.out.append(f"*TT {r}, 0, 30")
+                    # NOTE: V2/V3's own *TC has only ONE field (a bare
+                    # board clearance, e.g. "*TC 2") -- no leading drill
+                    # tolerance like V4/V5's "*TC <tol> <clearance>". It's
+                    # passed through unmodified here; kiub.py's own *TC
+                    # handler treats a missing second field as "no board
+                    # clearance given" and falls back to its
+                    # default_clearance setting, so every V2/V3 board ends
+                    # up using that fallback rather than a real per-board
+                    # value.
                 self.out.append(line)
                 continue
 
@@ -182,6 +226,14 @@ class DDFConverter:
                 if len(vals) >= 2:
                     idx     = int(line.split(",", 1)[0].split()[1])
                     val     = int(vals[1])
+                    # V2/V3 *TD diameters are stored in deci-millimetres
+                    # (0.1 mm units) -- NOT the 1/1200-inch database-unit
+                    # system every other V2/V3 coordinate field uses.
+                    # 254 = 25.4 mm/inch * 10 (the deci-mm-per-inch
+                    # constant), so this converts deci-mm -> 1/1200 inch.
+                    # Confirmed against sample drill values: raw values
+                    # like 6, 9, 11... only make sense as 0.6mm, 0.9mm,
+                    # 1.1mm... under this reading.
                     new_val = int(val * 1200 / 254)
                     new_line = f"*TD {idx}, {new_val}"
                 else:
@@ -189,7 +241,14 @@ class DDFConverter:
 
                 td_block.append(new_line)
 
-                # prepare duplicate (0–15 → 240–255)
+                # V2/V3 has no separate via-code range at all -- pads and
+                # vias share the same 0-15 drill/pad-table numbering, and
+                # a *V record's own pad_code field references that same
+                # low-numbered table directly (see handle_V). Duplicate
+                # every low code up to 240-255 as well, matching V4/V5's
+                # convention of reserving 240-255 for vias -- needed for
+                # the same standalone-Ultiboard-V5-compatibility reason
+                # as the *TT backfill above, not merely cosmetic.
                 if len(vals) >= 2 and idx < 16:
                     td_dups.append(f"*TD {idx + 240}, {new_val}")
 
@@ -209,13 +268,18 @@ class DDFConverter:
 
                 vals = [v.strip() for v in rest.split(",")]
 
-                if len(vals) < 9:  # original format has fewer fields
+                if len(vals) < 9:  # V2/V3 only stores 5 fields after the
+                                   # code (x1, x2, y, radius, clearance) --
+                                   # none of V4/V5's four aperture fields
+                                   # exist natively. Pad with zeros; those
+                                   # fields are unused by kiub.py in either
+                                   # version anyway.
                     rest = rest.rstrip() + ", 0, 0, 0, 0"
 
                 new_line = prefix + "," + rest
                 t_blocks[rec].append(new_line)
 
-                # DUPLICATE 0–15 → 240–255
+                # DUPLICATE 0-15 -> 240-255, same reasoning as *TD above.
                 if idx < 16:
                     prefix_parts    = prefix.split()
                     prefix_parts[1] = str(idx + 240)
@@ -247,6 +311,14 @@ class DDFConverter:
         # --------------------------------------------------
         # HANDLE SNO_SHP
         if header.startswith("*SNO_SHP"):
+            # *SNO_SHP is V2/V3's "no shape" placeholder for components
+            # without meaningful physical footprint geometry. It DOES
+            # carry real (if minimal) outline/pad data in the V2/V3
+            # source, but we discard it entirely here and substitute a
+            # fixed, hand-built flag-shaped marker instead -- every
+            # *SNO_SHP instance in the output is identical regardless of
+            # what the source actually stored. There is no V4/V5
+            # equivalent of this record at all.
             self.i += 1
             while self.i < len(self.lines):
                 if self.lines[self.i].startswith("*"):
@@ -281,6 +353,12 @@ class DDFConverter:
         meta = self.lines[self.i].strip()
         self.i += 1
 
+        # V2/V3 has only ONE 4-field text descriptor line per shape
+        # ("x y height rotation"), not V4/V5's two 6-field lines
+        # (reference + alias, each with width/thickness). We reuse this
+        # single line for both of V4/V5's descriptor lines below; width
+        # is estimated from height (TEXT_WIDTH_RATIO) and thickness is
+        # fixed, since V2/V3 stores neither.
         n   = nums(meta)
         h   = n[2]
         rot = ROT_MAP.get(n[3], 0)
@@ -303,6 +381,12 @@ class DDFConverter:
 
         # --------------------------------------------------
         # SPLIT INTO OUTLINE / PADS
+        # NOTE: a V2/V3 shape body has only these two sections -- there is
+        # no third arc/circle section at all (confirmed: real V2/V3
+        # shapes never have curved outline primitives). An empty arcs
+        # section (bare ";") is appended after PADS below, purely to
+        # satisfy V4/V5's three-section shape grammar (kiub.py expects
+        # outline + pads + arcs).
         outline = []
         pads    = []
         mode    = "outline"
@@ -316,6 +400,15 @@ class DDFConverter:
                 outline.append(line)
                 if line.endswith(";"):
                     # if text x,y = 0,0: center text in shape outline
+                    # (0,0) appears to be a V2/V3 sentinel meaning "use
+                    # the shape's own geometric centre" rather than a
+                    # literal origin placement. NOTE: this only reads
+                    # outline[0] (the first physical line of the outline
+                    # stream) -- if a shape's outline ever spans more
+                    # than one physical line before its terminating ';',
+                    # points on later lines would be excluded from this
+                    # centre calculation. No sample file in hand has a
+                    # multi-line outline, so unconfirmed in practice.
                     if self.shapes[-1]['X'] == 0 and self.shapes[-1]['Y'] == 0:
                         shape_center = [
                             (lambda v: (min(v) + max(v)) // 2)(
@@ -353,7 +446,19 @@ class DDFConverter:
                 is_last = (i == len(pads) - 1)
                 if line.endswith(";"):
                     line = line[:-1]
-                # mapping V2/V3 to V4: rotation and pad layerset
+                # rotation: raw 0-7 code -> V4/V5 degrees*64 (ROT_MAP).
+                # layerset: V2/V3's own file assigns layer bits
+                # SEQUENTIALLY, 12 bits higher than needed (bit 12 = Top,
+                # bit 13 = Bottom, bit 14 = In1, bit 15 = In2, ...); V4/V5's
+                # own convention instead INTERLEAVES each inner-layer pair
+                # (bit 0 = Top, bit 1 = Bottom, bit 2 = In2, bit 3 = In1,
+                # bit 4 = In4, bit 5 = In3, ...). The single >>12 shift
+                # happens to produce the correct V4/V5 bit order directly
+                # -- confirmed bit-for-bit against a per-layer test board
+                # opened in real Ultiboard V5/V5.72 (e.g. the pad drawn on
+                # In1 reads back as In2 and vice versa, matching V4/V5's
+                # interleaving exactly). Same transform used for *C
+                # pin/net lines below and for *V via layersets (handle_V).
                 parts    = line.split(',')
                 parts[1] = str(ROT_MAP[int(parts[1])])
                 parts[2] = f"{(int(parts[2], 16) >> 12):08x}"
@@ -370,6 +475,11 @@ class DDFConverter:
         else:
             self.out.append(";")
 
+        # Empty arcs section (V2/V3 shapes never have one, see note above)
+        # plus one extra trailing bare ';' -- matching an extra stray blank
+        # line observed after the arc section in genuine V4/V5 shape
+        # records themselves (harmless either way: kiub.py's own top-level
+        # dispatch loop silently skips any line not starting with '*').
         self.out.append(";\n;")
 
     # =========================================================
@@ -380,17 +490,35 @@ class DDFConverter:
         data = self.lines[self.i].strip()
         self.i += 1
 
+        # V2/V3's *C header carries NO shape-name field at all (just
+        # "*C <refdes> /<alias>") -- the component's shape is identified
+        # purely by shape_id: a 0-based index into self.shapes in file
+        # order. The V4/V5-style shape name only gets attached to the
+        # header line we emit below, via that lookup.
         n        = nums(data)
         shape_id = n[0]
         x, y     = n[1], n[2]
         rot      = ROT_MAP.get(n[3], 0)
 
-        # Signed integer correction for the reference x,y values
+        # Signed integer correction for the reference x,y values: V2/V3
+        # stores these two text-position offsets as unsigned 16-bit
+        # values (0-65535) rather than using a literal '-' sign like every
+        # other coordinate field in the file, so two's-complement
+        # correction is needed here specifically.
         n_x        = (n[4] if n[4] <= 32768 else n[4] - 65536) + self.shapes[shape_id]['X']
         n_y        = (n[5] if n[5] <= 32768 else n[5] - 65536) + self.shapes[shape_id]['Y']
         n_h        = self.shapes[shape_id]['Height']
         n_w        = int(n_h * TEXT_WIDTH_RATIO)
         n_t        = int(n_h * TEXT_THICKNESS_RATIO)
+        # NOTE: self.shapes[shape_id]['Rot'] is already a converted V4/V5
+        # degrees*64 value (see handle_S), not a raw 0-7 code -- so this
+        # ROT_MAP.get() lookup never matches (ROT_MAP's keys are only
+        # 0-7) and always falls back to its default, 0. This is
+        # deliberate, not a bug: kiub.py's own *C handler ADDS this field
+        # to the component's own placement rotation (it's not an
+        # absolute angle), so emitting 0 here means the REFDES/VALUE text
+        # simply rotates in lock-step with the component itself, with no
+        # extra per-shape offset on top of that.
         n_rot      = ROT_MAP.get(self.shapes[shape_id]['Rot'], 0)
         shape_name = self.shapes[shape_id]['name']
 
@@ -404,16 +532,27 @@ class DDFConverter:
             f"{x},{y},{rot},{n_x},{n_y},{n_rot},{n_w},{n_h},{n_t},"
             f"{n_x},{n_y},{n_rot},{n_w},{n_h},{n_t}"
         )
+        # V2/V3 has no force/thermal/power-simulation line at all --
+        # the position line is followed directly by pin/net lines.
+        # V4/V5's grammar requires a third line here; synthesize a fixed
+        # all-zero placeholder since there's no source data to carry over.
         self.out.append("0,0,0,0,0,0,0")
 
         # --------------------------------------------------
         # Read net lines until NEXT RECORD (line starting with '*')
+        # (V4.60 doesn't always terminate this block with a bare ';' --
+        # kiub.py's own *C handler tolerates that by pushing an
+        # unexpected '*' line back into its main dispatch loop, so we
+        # don't need to worry about it here.)
         net_lines = []
         while self.i < len(self.lines):
             line = self.lines[self.i].rstrip("\n")
             if line.startswith("*"):
                 break
-            # pad layerset mapping V2/V3 to V4
+            # pad/pin layerset: same >>12 bit-position remap as shape pad
+            # descriptors above (see the comment there) -- applied here to
+            # every other whitespace token (the layerset values; the
+            # alternating net-number tokens are left untouched).
             line = ' '.join(
                 f"{(int(v, 16) >> 12):08x}" if i % 2 == 1 else v
                 for i, v in enumerate(line.split())
@@ -426,6 +565,27 @@ class DDFConverter:
 
     # =========================================================
     # *LH / *LV
+    # V2/V3's *LH (Horizontal) and *LV (Vertical) are folded into V4/V5's
+    # single *LT (orthogonal trace) record here, with an explicit numeric
+    # <trace_type> ("0") and <orientation> ("1"=H, "2"=V) appended in
+    # place of V2/V3's own trailing F/V (Fixed/Variable) suffix.
+    #
+    # NAMING COLLISION: V2/V3's *LV means "Vertical trace" -- it has
+    # NOTHING to do with V4/V5's own *LV record, which means "arbitrary-
+    # angle Vector trace" (a completely different record kiub.py also
+    # dispatches on this same two-character tag). We only ever emit *LT
+    # here, never a real V4/V5-style *LV, so this collision never
+    # actually surfaces in our own output.
+    #
+    # NO DIAGONAL/45 DEGREE SUPPORT: V2/V3 has no record at all
+    # equivalent to V4/V5's diagonal-trace encoding (the 4/8 orientation
+    # codes on *LT, see kiub.py). A diagonal trace drawn in V2/V3 is
+    # stored in the DDF only as a "staircase" of ordinary *LH/*LV
+    # segments -- confirmed that Ultiboard's own Gerber output still
+    # renders a true diagonal for such a trace, but every other output
+    # path (including this DDF data itself) only ever sees the
+    # staircase, so that's what gets converted here too. There is no
+    # lossless way to recover the original diagonal from V2/V3 data.
     def handle_LH_LV(self):
         header = self.lines[self.i].strip()
         is_LH  = header.startswith("*LH")
@@ -468,9 +628,17 @@ class DDFConverter:
                 line = line[:-1]
 
             parts = line.split()
-            if parts and parts[-1].lower() == "fffff000":
-                # pad layerset mapping V2/V3 to V4
-                parts[-1] = f"{(int(parts[-1], 16) >> 12):08x}"
+            if len(parts) >= 4:
+                # pad code: V2/V3 has no separate via-code range, it reuses
+                # the same 0-15 pad-code table as ordinary pads. Offset by
+                # 240 so the via references the duplicated high-numbered
+                # twin (see handle_T), matching V4/V5's own convention of
+                # reserving codes 240-255 for vias.
+                parts[2] = str(int(parts[2]) + 240)
+                # layerset: same bit-position offset as pads/pins (handle_S,
+                # handle_C) - applies unconditionally, not just to the
+                # all-layers sentinel.
+                parts[3] = f"{(int(parts[3], 16) >> 12):08x}"
 
             line_fixed = " ".join(parts)
 
@@ -484,6 +652,13 @@ class DDFConverter:
 
     # =========================================================
     # *X
+    # V2/V3's *X record has only 5 numeric fields, in a DIFFERENT order
+    # from V4/V5's 7-field record: "x y height LAYER ROTATION text" here,
+    # vs V4/V5's "x y height width thickness ROTATION LAYER text" --
+    # note layer/rotation are swapped. There's no width/thickness field
+    # at all (both synthesized below: width = height, thickness fixed to
+    # 100). <layer> is also offset by one from V4/V5's convention (V2/V3
+    # layer 1 = V4/V5 layer 0 = silkscreen), hence "layer - 1" below.
     def handle_X(self):
         line = self.lines[self.i].rstrip("\n")
         self.i += 1
@@ -500,9 +675,22 @@ class DDFConverter:
         )
 
     # =========================================================
+    # Fabricate *TS and *SBOARD from scratch: NEITHER exists anywhere in
+    # the V2/V3 source. *TS (wave-solder direction) is a fixed, inert
+    # placeholder -- kiub.py never reads this field back out either way.
+    # *SBOARD's outline is a plain rectangle built directly from the
+    # header's own board width/height (handle_P), since V2/V3 has no
+    # concept of the board outline as its own named shape the way V4/V5
+    # does.
     def emit_TS_and_SBOARD(self):
         self.out.append("*TS H 0 0")
 
+        # odd()/even() apply V4/V5's own outline-stream encoding: each
+        # segment's START point must have an odd X (the marker bit for
+        # "this begins a new disconnected segment"), its END point an
+        # even X. Used here purely to make this synthetic rectangle
+        # parse correctly through kiub.py's ordinary outline-stream logic
+        # -- same convention real V4/V5 shape/board outlines use.
         def odd(x):  return x if x % 2      else x + 1
         def even(x): return x if x % 2 == 0 else x + 1
 
@@ -520,6 +708,7 @@ class DDFConverter:
             "0 0 0 0 0 100",
             "0.000000",
             ",".join(f"{a},{b},{c},{d}" for a, b, c, d in seg) + ";",
+            # empty pads + empty arcs sections -- a board shape has neither
             ";\n;"
         ])
 
