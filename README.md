@@ -72,7 +72,10 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 
 
 > [!NOTE]
-> The DDF folder contains sample DDF files to demonstrate the conversion capabilities.
+> The DDF folder contains sample DDF files to demonstrate the conversion capabilities.\
+> 
+> Polygons need to be reconstructed once the file is opened in KiCad as only the outline and hatch settings are copied.\
+> Either open the 'Edit' menu and select 'Fill all zones' or press the 'B' key. Don't forget to save the updated design.
 
 > [!TIP]
 > The optional GUI allows you to easily convert DDF files.\
@@ -83,7 +86,7 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > - Font selection.
 > - Open in KiCAD button (user selectable Kicad PCB executable path).
 > - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
-> - Adjustable geometry and clearance settings in 'Board defaults' and 'Fine-tuning'. Alter these cautiously as these 
+> - Adjustable geometry and clearance settings in 'Board defaults' and 'Fine-tuning'. Alter these cautiously as wrong values will result in DRC errors.
 
 ![Ultiboard to KiCad GUI](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI.png)
 ![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Board-defaults.png).
@@ -123,6 +126,8 @@ Erratum DDF file structure
 - Shape line values cannot contain 2 consecutive start points (see Shape lines below).
 ```
 ### Ultiboard to Kicad conversion info
+Below is a a summary of the key aspects.\
+Detailed information is available in [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md)
 ```
 - coordinates       V2.x, V3.x, V4.x   database units (1/1200 inch)
                     V5.x               nanometer
