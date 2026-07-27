@@ -89,8 +89,8 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > - Adjustable geometry and clearance settings in 'Board defaults' and 'Fine-tuning'. Alter these cautiously as wrong values will result in DRC errors.
 
 ![Ultiboard to KiCad GUI](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI.png)
-![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Board-defaults.png).
 ![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Fine-tuning.png).
+![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Board-defaults.png).
 
 
 ---
@@ -127,7 +127,7 @@ Erratum DDF file structure
 ```
 ### Ultiboard to Kicad conversion info
 Below is a a summary of the key aspects.\
-Detailed information is available in [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md)
+A full reverse-engineered description of the ASCII DDF file format is provided in [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md)
 ```
 - coordinates       V2.x, V3.x, V4.x   database units (1/1200 inch)
                     V5.x               nanometer
