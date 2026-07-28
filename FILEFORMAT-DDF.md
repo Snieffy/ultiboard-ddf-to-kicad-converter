@@ -68,8 +68,7 @@ version (see below).
   coordinates (the actual outline geometry comes from the `*SBOARD` shape,
   Section 3).
 - `<x1>, <y1>`: the opposite corner.
-- `<grid>`: default grid step, expressed as `n` meaning `1/n inch` (not a
-  raw database-unit length). Read but not used.
+- `<grid>`: default grid step, in the file's native unit system (Section 10.1). Read but not used by KIUB.
 - `<swap level>`: read but not used.
 - `<routing layers>` (optional): present in some V4 files (confirmed on
   `Ortho_V4.ddf`, an 8-field bounds line), absent in others (confirmed on
