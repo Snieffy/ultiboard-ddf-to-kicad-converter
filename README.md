@@ -110,12 +110,12 @@ These only apply when converting a V2.x/V3.x DDF file; they have no effect on na
 > - Converting a V2/V3 file renames and rewrites it on disk the same way the CLI does -- see the note above.
 > - Staircase-to-diagonal recovery and chamfering: When a V2/V3 file contains diagonal traces drawn as staircases, a pop-up shows the file's declared routing grid (editable) and lets you disable staircase recovery and/or chamfering for that conversion. If no staircases are found, a smaller pop-up still offers the chamfering option, since it applies independently of staircase recovery.
 
-![Ultiboard to KiCad GUI](assets/gui_main.png)
-![Conversion Settings - Board Defaults](assets/conversion_settings_board_defaults.png)
-![Conversion Settings - Geometry](assets/conversion_settings_geometry.png)
-![Conversion Settings - Fallback](assets/conversion_settings_fallback.png)
-![Staircase traces found pop-up](assets/pop_up_staircase.png)
-![Chamfer-only pop-up](assets/pop_up_chamfer.png)
+![Ultiboard to KiCad GUI](assets/gui_main.png)\
+![Conversion Settings - Board Defaults](assets/conversion_settings_board_defaults.png)\
+![Conversion Settings - Geometry](assets/conversion_settings_geometry.png)\
+![Conversion Settings - Fallback](assets/conversion_settings_fallback.png)\
+![Staircase traces found pop-up](assets/pop_up_staircase.png)\
+![Chamfer-only pop-up](assets/pop_up_chamfer.png)\
 ![V2/V3 working copy opened pop-up](assets/pop_up_V2V3_working_copy.png)
 
 
