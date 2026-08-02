@@ -648,12 +648,17 @@ all. Everything else about the V2/V3 header is different:
   pre-converter, and they are a plain board **width** and **height** (in
   the shared database-unit system, Section 10.1) — not a pair of corner
   coordinates. Per the Ultiboard reference manual, the third field is the
-  same `<grid>` field as V4/V5's own bounds line (Section 1) — expressed
-  as `n` meaning `1/n inch`. `<field4>` remains unconfirmed (values seen:
-  `0` and `1` across two sample boards, plausibly a `<swap
-  level>`-equivalent flag, matching V4/V5's field ordering immediately
-  after `<grid>`) — but is, like `<grid>`, not read by the pre-converter
-  either way.
+  same `<grid>` field as V4/V5's own bounds line (Section 1) — in the
+  file's native unit system (Section 10.1), the same as every other
+  coordinate/dimension field in the file. It is not itself read by the
+  pre-converter's board-geometry handling, but it is read separately, as
+  this file's declared default routing grid step (Section 9.11 covers
+  what that's used for and why it isn't necessarily reliable as a stand-in
+  for what any specific already-drawn feature actually used). `<field4>`
+  remains unconfirmed (values seen: `0` and `1` across two sample boards,
+  plausibly a `<swap level>`-equivalent flag, matching V4/V5's field
+  ordering immediately after `<grid>`) — but is not read by the
+  pre-converter either way.
 - **No layer-lamination string, no reference-point line, and no router-
   options/layer-direction-flags lines exist in the V2/V3 source at
   all.** The pre-converter fabricates fixed placeholder content for each
@@ -692,7 +697,7 @@ no separate alias-text descriptor line at all. During conversion, this
 single line is used to synthesize *both* of V4/V5's descriptor lines
 (reference and alias are given identical geometry), with `<width>`
 estimated from `<height>` and `<thickness>` fixed to `100`
-(Section 9.8 below). If a shape's stored `<x>,<y>` is `(0, 0)`, the
+(Section 9.9 below). If a shape's stored `<x>,<y>` is `(0, 0)`, the
 pre-converter additionally recentres it to the midpoint of the shape's
 own outline bounding box — `(0, 0)` in V2/V3 apparently serves as a
 "use the shape's geometric centre" sentinel rather than a literal origin
@@ -899,7 +904,52 @@ code is expected to be ≥ 240, which matters for the same standalone-use
 reason: a via edited directly in Ultiboard after conversion needs its
 pad code to resolve idiomatically, not merely validly.
 
-### 9.6 Text records — different field layout
+### 9.6 `*V` records — no `<rot>`/`<shift>`/`<via_index>`/`<glue_flag>` fields
+
+Native V2/V3 via record:
+
+```
+*V <x>
+<y> <netnr> <pad_code> <layerset hex>
+...
+<y> <netnr> <pad_code> <layerset hex>;
+```
+
+(Confirmed sample: `*V 120` / `540 171 0 fffff000;`.)
+
+A V2/V3 `*V` data line has only **4** fields — `<y> <netnr> <pad_code>
+<layerset hex>` — compared to V4/V5's 8 (Section 7): no `<rot>`,
+`<shift>`, `<via_index>`, or `<glue_flag>` at all. The first four fields
+that *are* present share the same meaning as their V4/V5 counterparts
+(Section 7); pad code offsetting (`+240`) follows the same rule described
+in Section 9.5 above.
+
+The missing `<shift>` field matters for one specific reason: Ultiboard
+allows a 4 quadrant via shift (depending on the via size, up to 11.67mil),
+evidently to fit vias more densely than the routing grid would otherwise
+allow (V4/V5's own `<shift>` field, Section 7, appears to record this same
+adjustment directly, though KIUB does not read it there either). V2/V3
+has no field recording this at all, so a V2/V3 file's via position simply
+*is* wherever this nudge left it, with nothing in the record indicating
+how far off-grid it landed or why.
+
+This is relevant to KIUB specifically because of how it recovers V2/V3
+diagonal traces and chamfered corners (Section 9.11/9.12 below): both
+work from the coordinates of adjacent `*LH`/`*LV` trace segments, and a
+nudged via's position can differ from where those adjacent segments'
+own endpoints would otherwise imply it should be. Empirically, across a
+range of via pad sizes, the nudge distance (identical along both axes)
+was found to follow `min(0.35 × pad_diameter_mil, 11.67 mil)` — i.e. it
+scales with the via's own pad size up to a fixed ceiling, not with drill
+size or trace width. Pad diameter is looked up per the physical layer in
+question (Front/Back/Inner can each declare a different diameter for the
+same pad code — Section 9.5) so that this stays correct even where those
+diameters actually differ. Both the staircase-recovery and chamfering
+features use this to keep a safe distance from any via for the net in
+question before modifying a corner near one, rather than relying on the
+corner's own coordinates matching the via's recorded position exactly.
+
+### 9.7 Text records — different field layout
 
 Native V2/V3 text record:
 
@@ -916,7 +966,7 @@ are synthesized: width copied from height, thickness fixed to `100`).
 pre-converter subtracts 1 from the V2/V3 value before emitting it, so
 V2/V3 layer `1` becomes V4/V5 layer `0` (silkscreen, Section 8).
 
-### 9.7 Rotation encoding differs entirely
+### 9.8 Rotation encoding differs entirely
 
 V2/V3 use a plain `0`–`7` code — side and angle share one small code, not
 a signed degrees×64 value — rather than mapping simply to
@@ -929,9 +979,9 @@ bottom-layer placement, Section 10.2). This code is used identically for
 shape text rotation, component placement rotation, and text-record
 rotation.
 
-### 9.8 No text width/thickness storage anywhere
+### 9.9 No text width/thickness storage anywhere
 
-Consistent with Sections 9.2 and 9.6 above: nowhere in the V2/V3 format
+Consistent with Sections 9.2 and 9.7 above: nowhere in the V2/V3 format
 is a text width or stroke thickness stored — only height. Both are
 estimated from height using fixed, user-tunable ratios (`width ≈ height
 × 0.8`, `thickness ≈ height × 0.1667` by default). This is a genuine
@@ -940,7 +990,7 @@ there is no lossless way to recover a V2/V3 file's original text
 width/thickness, since Ultiboard itself only ever derived it from height
 at render time.
 
-### 9.9 Known bug avoided by pre-converting rather than round-tripping through Ultiboard
+### 9.10 Known bug avoided by pre-converting rather than round-tripping through Ultiboard
 
 Ultiboard V5.72 itself is confirmed (by direct testing) to mis-handle
 V2/V3 pad drill codes when loading a V2/V3 file directly — KIUB's own
@@ -948,7 +998,7 @@ pre-converter avoids this bug entirely by working from the raw V2/V3
 source itself rather than relying on Ultiboard to open and re-save the
 file as V4/V5 first.
 
-### 9.10 `*LH`/`*LV` (orthogonal traces) — see Section 6.1
+### 9.11 `*LH`/`*LV` (orthogonal traces) — see Section 6.1
 
 Native V2/V3 orthogonal trace record:
 
@@ -986,17 +1036,101 @@ files.
 **`*LT` (Section 6.1) is not implemented in V2/V3 at all** — there is no
 diagonal/45° trace record in the V2/V3 DDF data. A diagonal trace drawn
 in V2/V3 is stored in the DDF itself only as a "staircase" of ordinary
-`*LH`/`*LV` orthogonal segments approximating the diagonal; Ultiboard's
-own Gerber output for such a design was confirmed to render a true
-diagonal trace regardless (a Gerber-generation-time visual
-approximation, evidently reconstructed from the staircase rather than
-stored as one), but every other output path — including the DDF file
-itself — only ever sees the staircase. Consequently, converting a
-V2/V3 file that contains a diagonal trace reproduces the staircase, not
-a true diagonal segment; there is no lossless way to recover the
-original diagonal from V2/V3 DDF data alone.
+`*LH`/`*LV` orthogonal segments approximating the diagonal.
 
-### 9.11 Synthetic `*TS` and `*SBOARD`
+The pre-converter reconstructs the diagonal itself. `*LH`/`*LV` records
+for the whole file are buffered rather than processed one at a time —
+they are stored sorted by column/row coordinate, not by trace or drawing
+order, so a single physical trace's segments are not generally adjacent
+in the file — and reassembled into connected polylines (open, two-ended
+traces) or loops (closed shape/pad/via outlines) via shared endpoints.
+
+For an open trace, two adjacent segments (one horizontal, one vertical)
+are treated as one 45° step whenever they are exactly equal in length.
+A single such pair is enough to be recovered as a diagonal on its own,
+subject to a length cap: an isolated pair of equal-length perpendicular
+legs is geometrically indistinguishable from an ordinary right-angle
+routing corner that merely happens to have two equal-length legs, so
+without a cap the two are conflated and an ordinary corner is
+misidentified as a one-step staircase. The cap is this file's own
+declared default grid step (Section 9.1), always capped again at a
+fixed 25 mil ceiling regardless of that declared value or of an explicit
+override — real staircases are drawn along the routing grid, and on a
+densely populated board that grid step already reflects the board's own
+copper clearance, so a genuine staircase step is not expected to exceed
+it; the 25 mil ceiling exists as a backstop independent of any
+particular file's grid. A run of two or more consecutive such pairs
+needs no separate justification beyond the length cap — coincidental
+equal-length matches repeating consistently across several consecutive
+corners are vanishingly unlikely from ordinary routing.
+
+A recovered diagonal is placed through the midpoints of its first and
+last unit segments, rather than through the staircase's own corner
+vertices — this point is always exactly the same regardless of which
+side of the staircase the original corners fell on, so it is correct
+without needing to determine that side at all. Where a recovered run
+meets a connecting segment beyond its own ends, that connecting segment
+is shortened to meet the diagonal directly rather than leaving a
+separate stub; if the connecting segment is itself short enough to be
+fully consumed this way from both its own ends, it disappears entirely
+and the diagonal continues straight through, exactly as if the
+connecting segment's own length had also been part of the staircase.
+
+A recovered run is never allowed to pass through a point where a via for
+its net sits (Section 9.6) — it is split there instead, so the via
+keeps a real, unmodified segment connecting to it on both sides.
+
+Closed loops (shape, pad, and via outlines) are merged the same way at
+their own natural corners; the length cap does not apply there, since a
+loop's corners carry no equivalent length-based ambiguity.
+
+The maximum recovered step length can be set independently of the
+declared grid (e.g. a manual correction, if the grid was changed after
+the traces being converted were drawn) or disabled entirely, in which
+case every `*LH`/`*LV` run is emitted unmerged, exactly as before this
+feature existed.
+
+### 9.12 Corner-slanting (chamfering) ordinary 90° trace corners
+
+Independently of staircase recovery above, the pre-converter can also
+replace an ordinary 90° corner between two straight trace segments (not
+originating from a recovered staircase) with a 45° chamfer — this
+applies regardless of whether the file contains any staircase-drawn
+diagonals at all.
+
+Each corner's chamfer length is capped to at most half of *either*
+adjacent leg's own full length, regardless of the configured limit: a
+chamfer only ever consumes material from the two legs already meeting at
+that corner, so the result can never extend beyond the original
+corner's own footprint, and no separate clearance check against nearby
+copper is needed as a result — if the original 90° corner was clear of
+other copper, a chamfer that stays within its own footprint is too. The
+configured limit itself defaults to tracking staircase recovery's own
+effective value (Section 9.11, itself already capped at the same fixed
+25 mil ceiling), and can be set independently of it, but either way only
+binds when both legs are long enough not to be limited by their own
+length first — a leg shorter than twice the configured limit is capped
+by its own available length instead, so a short leg between two other
+corners in quick succession still gets a proportionally smaller chamfer
+at each end rather than an oversized one or none at all. If both ends of
+such a leg end up trimming exactly half its own length, it is fully
+consumed and the two resulting chamfer diagonals — one from each
+corner — are merged into a single diagonal segment.
+
+A corner is left unmodified if a via for its net (Section 9.6) sits
+close enough to it that chamfering would risk moving the trace path away
+from the via's actual connection point — specifically, the single
+closest such via-adjacent point (which may be one of the trace's own two
+true end points, e.g. where it terminates at a pad, rather than an
+internal corner) is protected, not every corner merely within some fixed
+distance of a via, since a short leg can otherwise have both its own
+corners fall within that distance even though the via genuinely
+terminates the trace at only one of them.
+
+This feature and staircase recovery can each be disabled independently
+of the other.
+
+### 9.13 Synthetic `*TS` and `*SBOARD`
 
 Neither a `*TS` (wave-solder direction, Section 2) nor a board-outline
 shape record exists anywhere in the V2/V3 source. The pre-converter
