@@ -35,14 +35,6 @@ import os
 import re
 import sys
 
-# V2/V3 rotation code (0-7) -> V4.60 signed degrees*64 value.
-# Side and angle share one small code: 0-3 = top layer, 4-7 = bottom layer
-# (sign of the resulting value is what actually signals "bottom" downstream,
-# see kiub.py's *C/*X handling). NOT a simple code*90 progression on either
-# half -- confirmed against Ultiboard V5/V5.72 directly (opening a test
-# board built with one shape per rotation code):
-#   top    (codes 0-3): 0 deg, 270 deg, 180 deg,  90 deg  (angle runs BACKWARDS)
-#   bottom (codes 4-7): 0 deg,  90 deg, 180 deg, 270 deg  (angle runs FORWARDS)
 ROT_MAP = {
     0: 0, 1: 17280, 2: 11520, 3: 5760,
     4: -23040, 5: -5760, 6: -11520, 7: -17280
@@ -60,6 +52,69 @@ ROT_MAP = {
 TEXT_WIDTH_RATIO: float = 0.8       # estimated text width = height * this
 TEXT_THICKNESS_RATIO: float = 0.1667  # estimated text stroke thickness = height * this
 
+# Absolute hard ceiling (in mil) for a single V2/V3 staircase grid step
+# -- see DDFConverter._is_pairable(). An ordinary right-angle routing
+# corner can coincidentally have two equal-length legs; without a cap,
+# that's geometrically indistinguishable from a genuine one-step
+# staircase and gets merged into a diagonal it was never meant to be,
+# which can cut through nearby copper (pads, other traces) that the
+# original 90-degree corner safely cleared. A real Ultiboard-drawn
+# diagonal staircase only ever uses small, deliberate grid steps, so
+# capping the length filters this out. Empirically derived: a genuine
+# 100 mil right-angle corner with coincidentally equal legs was
+# observed getting misidentified as a staircase before this cap
+# existed, so 100 mil is already inside ambiguous territory rather
+# than a safe ceiling -- 25 mil was chosen as a broadly reasonable
+# value clear of that, with anything a genuine staircase might still
+# need beyond it left to the chamfer feature instead (see
+# CORNER_SLANT_LIMIT_MIL below).
+#
+# This ceiling is enforced unconditionally -- effective_staircase_limit_
+# units() applies it to *every* source of the effective limit, including
+# an explicit override from a CLI flag or the GUI's staircase-conversion
+# prompt, not just the automatic default. A user correction can only
+# ever move the effective limit down from this ceiling, never past it.
+STAIRCASE_CEILING_MIL: float = 25.0
+
+# Below the ceiling, the effective limit is further constrained by the
+# DDF header's own declared default grid step -- Ultiboard draws a
+# staircase along the routing grid by default, and on a densely
+# populated board (SMD components, small pads, tight trace/pad
+# clearance) that grid step is itself already sized to the board's own
+# clearance requirements: a staircase spanning several grid steps
+# between two SMD pads is exactly the geometry that, if merged into one
+# long diagonal, cuts across the gap DRC needs kept clear. So a small
+# declared grid genuinely means a small safe staircase-step ceiling,
+# board-density-dependent in a way the fixed ceiling above can't be on
+# its own -- it only ever *tightens* the ceiling, never loosens it past
+# STAIRCASE_CEILING_MIL. This relies on the header's declared grid being
+# correct for the whole file, which is only true if the user never
+# changed Ultiboard's own routing grid mid-design without it being
+# reflected in the header -- outside this tool's control to verify, so
+# the GUI's staircase-conversion prompt surfaces the declared value and
+# lets the user correct it before conversion if they know otherwise.
+STAIRCASE_LIMIT_MIL: float | None = None
+STAIRCASE_LIMIT_EXPLICIT: bool = False  # True once a caller has set an
+                                         # explicit value above (e.g. a
+                                         # user's own grid correction),
+                                         # disabling the header's own
+                                         # declared-grid value -- still
+                                         # subject to STAIRCASE_CEILING_MIL
+                                         # regardless.
+# A value of 0 (with STAIRCASE_LIMIT_EXPLICIT True) disables staircase
+# merging entirely: every *LH/*LV run is emitted unmerged, exactly as
+# kiub_v2v3 did before this feature existed.
+
+CORNER_SLANT_LIMIT_MIL: float | None = None
+CORNER_SLANT_LIMIT_EXPLICIT: bool = False  # True once a caller has set an
+                                            # explicit value above, disabling
+                                            # the "track the staircase limit"
+                                            # default. A value of 0 (with
+                                            # this flag True) disables
+                                            # corner slanting entirely.
+
+DB_UNITS_PER_MIL: float = 1.2  # 1 mil = 1/1000 inch; 1200 database units = 1 inch
+
 
 def nums(line):
     return list(map(int, re.findall(r'-?\d+', line)))
@@ -75,10 +130,35 @@ class DDFConverter:
         self.board_w = 0
         self.board_h = 0
 
+        # via centers by net, populated by prescan_vias() before the main
+        # conversion pass runs -- needed because *V records appear after
+        # *LH/*LV in file order, so via locations aren't known yet when
+        # traces are processed in a single left-to-right pass.
+        self.via_points_by_net = {}
+        self.via_pad_diameter = {}   # pad_code -> [inner, front, back] diameter, native db units
+
+        self.declared_grid_units = None  # from the *P header, set by handle_P
+        self._staircase_limit_resolved = False   # True once resolved (below)
+        self._staircase_limit_units_cache = None  # the resolved limit, or
+                                                    # None if merging is disabled
+
+        # Populated by _find_open_chain_runs(): the per-edge length
+        # (database units) of every genuinely multi-step run found (2+
+        # consecutive matching-length H/V pairs) -- not single-pair runs,
+        # since a single pair is exactly the case that's structurally
+        # ambiguous between a genuine staircase step and an ordinary
+        # corner with coincidentally equal legs (see _is_pairable's own
+        # docstring), so it's not a trustworthy contributor to "what
+        # step length do this file's real staircases actually use".
+        # Used by detect_staircases() to warn (never to silently change
+        # anything) when this disagrees with the declared grid.
+        self.multi_step_run_lengths = []
+
         self.t_store = {"TD": [], "T0": [], "T1": [], "T2": []}
 
     # =========================================================
     def convert(self):
+        self.prescan_vias()
         self.srecord_start = False
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
@@ -116,39 +196,148 @@ class DDFConverter:
         return "\n".join(self.out)
 
     # =========================================================
+    # Via pre-scan: populates self.via_points_by_net from every *V
+    # record in the file, before the main conversion pass begins. This
+    # is used later by the *LH/*LV staircase merge to make sure a
+    # diagonal is never drawn through a point where a via actually sits
+    # (which would disconnect it) -- see _split_at_via_waypoints().
+    # Empirically measured (across a range of via pad sizes from 2 mil to
+    # 100 mil): Ultiboard's autorouter can nudge a via's center off its
+    # ideal position, toward one of four diagonal quadrants, by a
+    # distance -- identical along both axes -- that scales with the
+    # via's own pad (copper) diameter, up to a fixed ceiling:
+    #   per_axis_shift_mil = min(VIA_SHIFT_COEFF * diameter_mil, VIA_SHIFT_CAP_MIL)
+    # Not drill-size or trace-width related -- purely a function of the
+    # via's own pad size. VIA_SHIFT_CAP_MIL is applied for any via whose
+    # pad diameter is roughly 33 mil or larger; below that the shift
+    # scales down linearly, dropping to well under half the ceiling for
+    # small vias.
+    VIA_SHIFT_COEFF   = 0.35
+    VIA_SHIFT_CAP_MIL = 11.67
+
+    def prescan_vias(self):
+        """Populate self.via_points_by_net with each via's position and
+        pad code -- entries are (x, y, pad_code), not a pre-baked
+        radius -- because *T0/*T1/*T2 (Inner/Front/Back) can each
+        declare a genuinely different pad diameter for the same code,
+        and which one is relevant depends on which layer is actually
+        being checked, known only later at the call site (see
+        via_radius_for_layer). Baking in a single radius here (e.g. the
+        largest of the three) would over-protect whichever layer has
+        the smaller pad.
+
+        self.via_pad_diameter[pad_code] holds a 3-tuple
+        (inner, front, back) in native database units, straight from
+        each *T0/*T1/*T2 record's own `y` field (see FILEFORMAT-DDF.md's
+        *T0/*T1/*T2 section for why that field, and not *TD -- drill
+        diameter, a different quantity that doesn't correlate with the
+        observed nudge at all). These records reliably appear near the
+        top of the file, well before any *V record that could reference
+        them, so a single linear pass collecting both is safe.
+        """
+        i = 0
+        while i < len(self.lines):
+            line = self.lines[i].strip()
+            if line.startswith(("*T0 ", "*T1 ", "*T2 ")):
+                try:
+                    sub    = int(line[2])  # 0/1/2 from "*T0"/"*T1"/"*T2"
+                    prefix, rest = line.split(",", 1)
+                    idx = int(prefix.split()[1])
+                    y   = float(rest.split(",")[2])
+                except (ValueError, IndexError):
+                    i += 1
+                    continue
+                entry = self.via_pad_diameter.setdefault(idx, [0.0, 0.0, 0.0])
+                entry[sub] = y
+                i += 1
+            elif line.startswith("*V"):
+                x = int(line[2:].strip())
+                i += 1
+                while True:
+                    raw      = self.lines[i].strip()
+                    is_last  = raw.endswith(";")
+                    body     = raw[:-1] if is_last else raw
+                    parts    = body.split()
+                    y, net   = int(parts[0]), int(parts[1])
+                    pad_code = int(parts[2]) if len(parts) >= 3 else None
+                    self.via_points_by_net.setdefault(net, set()).add((x, y, pad_code))
+                    i += 1
+                    if is_last:
+                        break
+            else:
+                i += 1
+
+    def _via_radius_for_layer(self, pad_code, layer):
+        """The search radius (database units, Euclidean) for this pad
+        code's via nudge on this specific DDF layer.
+
+        Layer-to-sub-table mapping: DDF layer 1 is always Front, DDF
+        layer 2 is always Back, and any other layer number is Inner --
+        confirmed against kiub.py's own layersCu table, whose first two
+        list positions (used directly as bit-compress indices via
+        layer_from_bit) are F.Cu and B.Cu regardless of the board's
+        total layer count, with every inner layer coming after. Reusing
+        that same convention here (rather than re-deriving it) is what
+        keeps this in sync with how kiub.py itself will interpret the
+        very same layer number later.
+        """
+        inner, front, back = self.via_pad_diameter.get(pad_code, (0.0, 0.0, 0.0))
+        diameter_units = front if layer == 1 else back if layer == 2 else inner
+        diameter_mil = diameter_units / DB_UNITS_PER_MIL
+        shift_mil = min(self.VIA_SHIFT_COEFF * diameter_mil, self.VIA_SHIFT_CAP_MIL)
+        return shift_mil * DB_UNITS_PER_MIL * (2 ** 0.5)
+
+    def _point_near_via(self, point, via_points, layer):
+        """True if `point` falls within any via's *own* nudge-search
+        radius for this specific layer -- i.e. genuinely close enough
+        to that via's real connection point on THIS layer, not just
+        "nearby" by some tolerance shared across every via and layer.
+
+        Each entry in `via_points` is (x, y, pad_code), populated by
+        prescan_vias(); the radius itself is computed per-via, per-call
+        via _via_radius_for_layer(pad_code, layer) rather than being
+        baked in ahead of time, since *T0/*T1/*T2 can each declare a
+        genuinely different pad diameter for the same code -- using one
+        blanket value (e.g. the largest of the three) would
+        over-protect whichever layer actually has the smaller pad. A
+        via whose resolved radius is <= 0 (its pad code had no matching
+        diameter for this layer, an unexpected but possible
+        malformed-file case) is skipped rather than treated as having
+        infinite or zero-tolerance reach either way.
+        """
+        for vx, vy, pad_code in via_points:
+            radius = self._via_radius_for_layer(pad_code, layer)
+            if radius <= 0:
+                continue
+            if (point[0] - vx) ** 2 + (point[1] - vy) ** 2 <= radius * radius:
+                return True
+        return False
+
+    # =========================================================
     # *P
     def handle_P(self):
         header = self.lines[self.i].strip()
         self.i += 1
 
-        self.i += 1  # skip version line -- major/minor is only used upstream
-                      # (kiub.py's open_ddf) to decide whether to invoke this
-                      # pre-converter at all; its content is discarded here
-                      # and replaced unconditionally with "4 60" below.
+        self.i += 1  # skip version line
 
         dims = self.lines[self.i].strip()
         self.i += 1
 
-        # V2/V3's own bounds line is "<width>, <height>, <grid>, <field4>;"
-        # (NOT a pair of outline corners like V4/V5's own bounds line) --
-        # only the first two fields (board width/height, in the same
-        # database-unit system as everything else) are used. <grid> and
-        # <field4> are read here via the same regex but never assigned,
-        # since kiub.py itself never reads either field back out.
         n = nums(dims)
         self.board_w, self.board_h = n[0], n[1]
+        # The 3rd field is the default grid step (database units). It is
+        # NOT used to detect individual *LH/*LV staircase edges -- see
+        # _is_pairable() -- since Ultiboard lets the user change the
+        # routing grid at any time and it doesn't reliably reflect the
+        # step size actually used for any given trace. It's kept here
+        # only as a candidate for effective_staircase_limit_mil()'s
+        # auto-adjustment, which cross-checks it against how many edges
+        # actually share that exact length before trusting it.
+        self.declared_grid_units = n[2] if len(n) > 2 else None
 
         self.out.append(header)
         self.out.append("4 60")
-        # Everything from here down is fabricated: V2/V3 has no outline
-        # corners, layer-lamination string, reference point, router
-        # options, layer-direction flags, or power-plane data at all, and
-        # kiub.py itself never reads any of these fields back out (they
-        # only exist to satisfy V4/V5's fixed header grammar). The one
-        # field worth a comment is the hardcoded max-layer count of 22:
-        # unlike the rest, this one IS meaningful -- it's the documented
-        # maximum layer count for the V2/V3 format per the Ultiboard
-        # reference manual, not an arbitrary filler value.
         self.out.append(f"{self.board_w}, {self.board_h}, 0, 0, 6, 0, 22;")
         self.out.append("(|+|+|+|+|+|+|+|+|+|+|)")
         self.out.append("0, 0")
@@ -193,28 +382,10 @@ class DDFConverter:
             # -------------------------
             if rec in ("TP", "TT", "TC"):
                 if line.startswith("*TP"):
-                    # V2/V3's own *TP value (e.g. "fffff000") is discarded
-                    # and replaced unconditionally -- kiub.py never reads
-                    # this field back out either way.
                     line = '*TP ffffffff'
                 if line.startswith("*TC"):
-                    # V2/V3 only ever defines trace codes 0-15; V4/V5's own
-                    # table spans 0-31 (kiub.py's TT handler). Backfill the
-                    # upper half with a harmless default so a standalone
-                    # V2v3-converted file opened directly in Ultiboard V5
-                    # (not just fed to kiub.py) has a defined entry for
-                    # every code it might reference.
                     for r in range(16, 32):
                         self.out.append(f"*TT {r}, 0, 30")
-                    # NOTE: V2/V3's own *TC has only ONE field (a bare
-                    # board clearance, e.g. "*TC 2") -- no leading drill
-                    # tolerance like V4/V5's "*TC <tol> <clearance>". It's
-                    # passed through unmodified here; kiub.py's own *TC
-                    # handler treats a missing second field as "no board
-                    # clearance given" and falls back to its
-                    # default_clearance setting, so every V2/V3 board ends
-                    # up using that fallback rather than a real per-board
-                    # value.
                 self.out.append(line)
                 continue
 
@@ -226,14 +397,6 @@ class DDFConverter:
                 if len(vals) >= 2:
                     idx     = int(line.split(",", 1)[0].split()[1])
                     val     = int(vals[1])
-                    # V2/V3 *TD diameters are stored in deci-millimetres
-                    # (0.1 mm units) -- NOT the 1/1200-inch database-unit
-                    # system every other V2/V3 coordinate field uses.
-                    # 254 = 25.4 mm/inch * 10 (the deci-mm-per-inch
-                    # constant), so this converts deci-mm -> 1/1200 inch.
-                    # Confirmed against sample drill values: raw values
-                    # like 6, 9, 11... only make sense as 0.6mm, 0.9mm,
-                    # 1.1mm... under this reading.
                     new_val = int(val * 1200 / 254)
                     new_line = f"*TD {idx}, {new_val}"
                 else:
@@ -241,14 +404,7 @@ class DDFConverter:
 
                 td_block.append(new_line)
 
-                # V2/V3 has no separate via-code range at all -- pads and
-                # vias share the same 0-15 drill/pad-table numbering, and
-                # a *V record's own pad_code field references that same
-                # low-numbered table directly (see handle_V). Duplicate
-                # every low code up to 240-255 as well, matching V4/V5's
-                # convention of reserving 240-255 for vias -- needed for
-                # the same standalone-Ultiboard-V5-compatibility reason
-                # as the *TT backfill above, not merely cosmetic.
+                # prepare duplicate (0–15 → 240–255)
                 if len(vals) >= 2 and idx < 16:
                     td_dups.append(f"*TD {idx + 240}, {new_val}")
 
@@ -268,18 +424,13 @@ class DDFConverter:
 
                 vals = [v.strip() for v in rest.split(",")]
 
-                if len(vals) < 9:  # V2/V3 only stores 5 fields after the
-                                   # code (x1, x2, y, radius, clearance) --
-                                   # none of V4/V5's four aperture fields
-                                   # exist natively. Pad with zeros; those
-                                   # fields are unused by kiub.py in either
-                                   # version anyway.
+                if len(vals) < 9:  # original format has fewer fields
                     rest = rest.rstrip() + ", 0, 0, 0, 0"
 
                 new_line = prefix + "," + rest
                 t_blocks[rec].append(new_line)
 
-                # DUPLICATE 0-15 -> 240-255, same reasoning as *TD above.
+                # DUPLICATE 0–15 → 240–255
                 if idx < 16:
                     prefix_parts    = prefix.split()
                     prefix_parts[1] = str(idx + 240)
@@ -311,14 +462,6 @@ class DDFConverter:
         # --------------------------------------------------
         # HANDLE SNO_SHP
         if header.startswith("*SNO_SHP"):
-            # *SNO_SHP is V2/V3's "no shape" placeholder for components
-            # without meaningful physical footprint geometry. It DOES
-            # carry real (if minimal) outline/pad data in the V2/V3
-            # source, but we discard it entirely here and substitute a
-            # fixed, hand-built flag-shaped marker instead -- every
-            # *SNO_SHP instance in the output is identical regardless of
-            # what the source actually stored. There is no V4/V5
-            # equivalent of this record at all.
             self.i += 1
             while self.i < len(self.lines):
                 if self.lines[self.i].startswith("*"):
@@ -353,12 +496,6 @@ class DDFConverter:
         meta = self.lines[self.i].strip()
         self.i += 1
 
-        # V2/V3 has only ONE 4-field text descriptor line per shape
-        # ("x y height rotation"), not V4/V5's two 6-field lines
-        # (reference + alias, each with width/thickness). We reuse this
-        # single line for both of V4/V5's descriptor lines below; width
-        # is estimated from height (TEXT_WIDTH_RATIO) and thickness is
-        # fixed, since V2/V3 stores neither.
         n   = nums(meta)
         h   = n[2]
         rot = ROT_MAP.get(n[3], 0)
@@ -381,12 +518,6 @@ class DDFConverter:
 
         # --------------------------------------------------
         # SPLIT INTO OUTLINE / PADS
-        # NOTE: a V2/V3 shape body has only these two sections -- there is
-        # no third arc/circle section at all (confirmed: real V2/V3
-        # shapes never have curved outline primitives). An empty arcs
-        # section (bare ";") is appended after PADS below, purely to
-        # satisfy V4/V5's three-section shape grammar (kiub.py expects
-        # outline + pads + arcs).
         outline = []
         pads    = []
         mode    = "outline"
@@ -400,15 +531,6 @@ class DDFConverter:
                 outline.append(line)
                 if line.endswith(";"):
                     # if text x,y = 0,0: center text in shape outline
-                    # (0,0) appears to be a V2/V3 sentinel meaning "use
-                    # the shape's own geometric centre" rather than a
-                    # literal origin placement. NOTE: this only reads
-                    # outline[0] (the first physical line of the outline
-                    # stream) -- if a shape's outline ever spans more
-                    # than one physical line before its terminating ';',
-                    # points on later lines would be excluded from this
-                    # centre calculation. No sample file in hand has a
-                    # multi-line outline, so unconfirmed in practice.
                     if self.shapes[-1]['X'] == 0 and self.shapes[-1]['Y'] == 0:
                         shape_center = [
                             (lambda v: (min(v) + max(v)) // 2)(
@@ -446,19 +568,7 @@ class DDFConverter:
                 is_last = (i == len(pads) - 1)
                 if line.endswith(";"):
                     line = line[:-1]
-                # rotation: raw 0-7 code -> V4/V5 degrees*64 (ROT_MAP).
-                # layerset: V2/V3's own file assigns layer bits
-                # SEQUENTIALLY, 12 bits higher than needed (bit 12 = Top,
-                # bit 13 = Bottom, bit 14 = In1, bit 15 = In2, ...); V4/V5's
-                # own convention instead INTERLEAVES each inner-layer pair
-                # (bit 0 = Top, bit 1 = Bottom, bit 2 = In2, bit 3 = In1,
-                # bit 4 = In4, bit 5 = In3, ...). The single >>12 shift
-                # happens to produce the correct V4/V5 bit order directly
-                # -- confirmed bit-for-bit against a per-layer test board
-                # opened in real Ultiboard V5/V5.72 (e.g. the pad drawn on
-                # In1 reads back as In2 and vice versa, matching V4/V5's
-                # interleaving exactly). Same transform used for *C
-                # pin/net lines below and for *V via layersets (handle_V).
+                # mapping V2/V3 to V4: rotation and pad layerset
                 parts    = line.split(',')
                 parts[1] = str(ROT_MAP[int(parts[1])])
                 parts[2] = f"{(int(parts[2], 16) >> 12):08x}"
@@ -475,11 +585,6 @@ class DDFConverter:
         else:
             self.out.append(";")
 
-        # Empty arcs section (V2/V3 shapes never have one, see note above)
-        # plus one extra trailing bare ';' -- matching an extra stray blank
-        # line observed after the arc section in genuine V4/V5 shape
-        # records themselves (harmless either way: kiub.py's own top-level
-        # dispatch loop silently skips any line not starting with '*').
         self.out.append(";\n;")
 
     # =========================================================
@@ -490,35 +595,17 @@ class DDFConverter:
         data = self.lines[self.i].strip()
         self.i += 1
 
-        # V2/V3's *C header carries NO shape-name field at all (just
-        # "*C <refdes> /<alias>") -- the component's shape is identified
-        # purely by shape_id: a 0-based index into self.shapes in file
-        # order. The V4/V5-style shape name only gets attached to the
-        # header line we emit below, via that lookup.
         n        = nums(data)
         shape_id = n[0]
         x, y     = n[1], n[2]
         rot      = ROT_MAP.get(n[3], 0)
 
-        # Signed integer correction for the reference x,y values: V2/V3
-        # stores these two text-position offsets as unsigned 16-bit
-        # values (0-65535) rather than using a literal '-' sign like every
-        # other coordinate field in the file, so two's-complement
-        # correction is needed here specifically.
+        # Signed integer correction for the reference x,y values
         n_x        = (n[4] if n[4] <= 32768 else n[4] - 65536) + self.shapes[shape_id]['X']
         n_y        = (n[5] if n[5] <= 32768 else n[5] - 65536) + self.shapes[shape_id]['Y']
         n_h        = self.shapes[shape_id]['Height']
         n_w        = int(n_h * TEXT_WIDTH_RATIO)
         n_t        = int(n_h * TEXT_THICKNESS_RATIO)
-        # NOTE: self.shapes[shape_id]['Rot'] is already a converted V4/V5
-        # degrees*64 value (see handle_S), not a raw 0-7 code -- so this
-        # ROT_MAP.get() lookup never matches (ROT_MAP's keys are only
-        # 0-7) and always falls back to its default, 0. This is
-        # deliberate, not a bug: kiub.py's own *C handler ADDS this field
-        # to the component's own placement rotation (it's not an
-        # absolute angle), so emitting 0 here means the REFDES/VALUE text
-        # simply rotates in lock-step with the component itself, with no
-        # extra per-shape offset on top of that.
         n_rot      = ROT_MAP.get(self.shapes[shape_id]['Rot'], 0)
         shape_name = self.shapes[shape_id]['name']
 
@@ -532,27 +619,16 @@ class DDFConverter:
             f"{x},{y},{rot},{n_x},{n_y},{n_rot},{n_w},{n_h},{n_t},"
             f"{n_x},{n_y},{n_rot},{n_w},{n_h},{n_t}"
         )
-        # V2/V3 has no force/thermal/power-simulation line at all --
-        # the position line is followed directly by pin/net lines.
-        # V4/V5's grammar requires a third line here; synthesize a fixed
-        # all-zero placeholder since there's no source data to carry over.
         self.out.append("0,0,0,0,0,0,0")
 
         # --------------------------------------------------
         # Read net lines until NEXT RECORD (line starting with '*')
-        # (V4.60 doesn't always terminate this block with a bare ';' --
-        # kiub.py's own *C handler tolerates that by pushing an
-        # unexpected '*' line back into its main dispatch loop, so we
-        # don't need to worry about it here.)
         net_lines = []
         while self.i < len(self.lines):
             line = self.lines[self.i].rstrip("\n")
             if line.startswith("*"):
                 break
-            # pad/pin layerset: same >>12 bit-position remap as shape pad
-            # descriptors above (see the comment there) -- applied here to
-            # every other whitespace token (the layerset values; the
-            # alternating net-number tokens are left untouched).
+            # pad layerset mapping V2/V3 to V4
             line = ' '.join(
                 f"{(int(v, 16) >> 12):08x}" if i % 2 == 1 else v
                 for i, v in enumerate(line.split())
@@ -565,55 +641,970 @@ class DDFConverter:
 
     # =========================================================
     # *LH / *LV
-    # V2/V3's *LH (Horizontal) and *LV (Vertical) are folded into V4/V5's
-    # single *LT (orthogonal trace) record here, with an explicit numeric
-    # <trace_type> ("0") and <orientation> ("1"=H, "2"=V) appended in
-    # place of V2/V3's own trailing F/V (Fixed/Variable) suffix.
     #
-    # NAMING COLLISION: V2/V3's *LV means "Vertical trace" -- it has
-    # NOTHING to do with V4/V5's own *LV record, which means "arbitrary-
-    # angle Vector trace" (a completely different record kiub.py also
-    # dispatches on this same two-character tag). We only ever emit *LT
-    # here, never a real V4/V5-style *LV, so this collision never
-    # actually surfaces in our own output.
+    # V2/V3 has no native record for 45-degree traces: unlike V4/V5's *LT
+    # (which supports orientation 4/8 = NE/SE diagonal directly), *LH/*LV
+    # can only express strictly horizontal or vertical segments. A
+    # diagonal trace therefore gets rasterised into a staircase of tiny
+    # H/V steps. The DDF header's declared default grid step is NOT a
+    # reliable indicator of the step size used, though: Ultiboard lets
+    # the user change the routing grid at any time, so different traces
+    # (and even different runs within the same file) can be rasterised
+    # at different step sizes. Staircase detection below is therefore
+    # purely geometric -- see _is_pairable() -- and never consults the
+    # header's grid value.
     #
-    # NO DIAGONAL/45 DEGREE SUPPORT: V2/V3 has no record at all
-    # equivalent to V4/V5's diagonal-trace encoding (the 4/8 orientation
-    # codes on *LT, see kiub.py). A diagonal trace drawn in V2/V3 is
-    # stored in the DDF only as a "staircase" of ordinary *LH/*LV
-    # segments -- confirmed that Ultiboard's own Gerber output still
-    # renders a true diagonal for such a trace, but every other output
-    # path (including this DDF data itself) only ever sees the
-    # staircase, so that's what gets converted here too. There is no
-    # lossless way to recover the original diagonal from V2/V3 data.
+    # Ultiboard's own plot output reconstructs the true diagonal from
+    # this staircase; the logic below does the same thing here, so the
+    # V4 intermediate file (and everything downstream of it) gets a
+    # single diagonal *LT segment instead of dozens of tiny H/V ones.
     def handle_LH_LV(self):
-        header = self.lines[self.i].strip()
-        is_LH  = header.startswith("*LH")
+        edges = []  # buffered across the whole contiguous *LH/*LV run
 
-        self.out.append("*LT" + header[3:])
-        self.i += 1
+        while self.i < len(self.lines):
+            line = self.lines[self.i].strip()
+            if not (line.startswith("*LH") or line.startswith("*LV")):
+                break
 
-        while True:
-            raw     = self.lines[self.i].strip()
-            is_last = raw.endswith(";")
-            line    = raw[:-1] if is_last else raw
-            parts   = line.split()
-
-            if parts:
-                trace = parts[-1]
-                if trace.endswith(("F", "V")):
-                    parts[-1] = trace[:-1]
-                parts.extend(["0", "1" if is_LH else "2"])
-
-            new_line = " ".join(parts)
-            if is_last:
-                new_line += ";"
-
-            self.out.append(new_line)
+            header = line
+            is_LH  = header.startswith("*LH")
+            hparts = header[3:].split()
+            layer, coord1 = int(hparts[0]), int(hparts[1])
             self.i += 1
 
-            if is_last:
+            while True:
+                raw     = self.lines[self.i].strip()
+                is_last = raw.endswith(";")
+                body    = raw[:-1] if is_last else raw
+                parts   = body.split()
+
+                c0, c1, net = int(parts[0]), int(parts[1]), int(parts[2])
+                tcode_raw   = parts[3]
+                # trailing letter (e.g. "1F") is dropped, matching the
+                # original behaviour -- trace_type is always emitted as 0
+                flag  = tcode_raw[-1] if tcode_raw[-1].isalpha() else ""
+                tcode = int(tcode_raw[:-1] if flag else tcode_raw)
+
+                if is_LH:
+                    p1, p2 = (c0, coord1), (c1, coord1)
+                else:
+                    p1, p2 = (coord1, c0), (coord1, c1)
+
+                edges.append({
+                    "p1": p1, "p2": p2, "layer": layer, "net": net,
+                    "tcode": tcode, "flag": flag,
+                    "orient": "H" if is_LH else "V",
+                    "length": abs(c1 - c0),
+                })
+
+                self.i += 1
+                if is_last:
+                    break
+
+        self._emit_LH_LV_edges(edges)
+
+    @staticmethod
+    def _sign(v):
+        return 1 if v > 0 else (-1 if v < 0 else 0)
+
+    def _build_LH_LV_components(self, group_edges):
+        """Group edges (already filtered to one layer/net/tcode/flag key)
+        into connected components via shared endpoints."""
+        adjacency = {}
+        for idx, e in enumerate(group_edges):
+            adjacency.setdefault(e["p1"], []).append((idx, e["p2"]))
+            adjacency.setdefault(e["p2"], []).append((idx, e["p1"]))
+
+        visited = [False] * len(group_edges)
+        components = []
+        for start_idx in range(len(group_edges)):
+            if visited[start_idx]:
+                continue
+            stack, comp = [start_idx], set()
+            while stack:
+                idx = stack.pop()
+                if idx in comp:
+                    continue
+                comp.add(idx)
+                visited[idx] = True
+                e = group_edges[idx]
+                for pt in (e["p1"], e["p2"]):
+                    for j, _ in adjacency[pt]:
+                        if j not in comp:
+                            stack.append(j)
+            components.append(comp)
+        return adjacency, components
+
+    def _order_LH_LV_component(self, group_edges, comp_edge_idxs):
+        """Walk one connected component into an ordered edge sequence.
+
+        Returns (ordered, is_loop) where ordered is a list of
+        (edge_idx, from_point, to_point), or (None, None) if the
+        component branches (a point with >2 edges) -- callers should
+        leave a branching component's edges unmerged, since it isn't a
+        simple staircase/polyline.
+        """
+        point_edges = {}
+        for idx in comp_edge_idxs:
+            e = group_edges[idx]
+            point_edges.setdefault(e["p1"], []).append(idx)
+            point_edges.setdefault(e["p2"], []).append(idx)
+
+        if max(len(v) for v in point_edges.values()) > 2:
+            return None, None
+
+        endpoints = [p for p, v in point_edges.items() if len(v) == 1]
+        is_loop   = not endpoints
+
+        if endpoints:
+            start_point = endpoints[0]
+        else:
+            # Closed loop: start anywhere: _compress_LH_LV_chain's caller
+            # rotates the walk to a safe seam afterwards (see
+            # _rotate_to_safe_seam), so the exact starting point here
+            # doesn't matter.
+            first_idx = next(iter(comp_edge_idxs))
+            start_point = group_edges[first_idx]["p1"]
+
+        ordered, used, cur = [], set(), start_point
+        while True:
+            candidates = [idx for idx in point_edges[cur] if idx not in used]
+            if not candidates:
                 break
+            idx = candidates[0]
+            e = group_edges[idx]
+            other = e["p2"] if e["p1"] == cur else e["p1"]
+            ordered.append((idx, cur, other))
+            used.add(idx)
+            cur = other
+            if is_loop and cur == start_point:
+                break
+            if len(used) == len(comp_edge_idxs):
+                break
+        return ordered, is_loop
+
+    def _is_pairable(self, e_a, e_b):
+        """Two adjacent edges can form one 45-degree step of a staircase
+        if they run in different directions (H then V, or V then H),
+        have exactly equal length -- regardless of what that length
+        actually is -- and that length doesn't exceed the effective
+        staircase limit (see effective_staircase_limit_units()). The
+        length cap exists because an ordinary right-angle routing
+        corner can coincidentally have two equal-length legs, which is
+        otherwise geometrically indistinguishable from a genuine
+        one-step staircase; a real Ultiboard-drawn diagonal only ever
+        uses small, deliberate grid steps, so anything longer is
+        assumed to be an ordinary corner instead and left alone. The
+        DDF header's declared default grid step is *not* used for the
+        equality check itself: Ultiboard lets the user change the
+        routing grid at any time, so different traces (and even
+        different runs within the same file) can be rasterised at
+        different step sizes."""
+        if e_a["orient"] == e_b["orient"] or e_a["length"] != e_b["length"]:
+            return False
+        limit = self.effective_staircase_limit_units()
+        return limit is not None and e_a["length"] <= limit
+
+    def effective_staircase_limit_units(self):
+        """Resolve (and cache) the maximum edge length, in database
+        units, that's still eligible to be treated as a staircase grid
+        step. Precedence:
+          1. An explicit override (STAIRCASE_LIMIT_EXPLICIT) -- e.g. a
+             user's own grid correction -- if set.
+          2. Otherwise, the header's declared default grid step
+             directly, unconditionally (Ultiboard draws a staircase
+             along the routing grid by default, and that step's own
+             correctness is the caller's responsibility to verify --
+             see STAIRCASE_LIMIT_MIL's module comment).
+          3. Otherwise (no declared grid at all), STAIRCASE_CEILING_MIL
+             itself.
+        Whichever of these applies is then capped at STAIRCASE_CEILING_MIL
+        -- always, including the explicit-override case -- so a bad
+        correction can only ever tighten the effective limit, never
+        loosen it past that ceiling.
+        Returns None if merging is disabled (limit resolves to 0).
+        """
+        if self._staircase_limit_resolved:
+            return self._staircase_limit_units_cache
+
+        ceiling_units = STAIRCASE_CEILING_MIL * DB_UNITS_PER_MIL
+
+        if STAIRCASE_LIMIT_EXPLICIT:
+            base_units = STAIRCASE_LIMIT_MIL * DB_UNITS_PER_MIL if STAIRCASE_LIMIT_MIL else 0
+        elif self.declared_grid_units:
+            base_units = self.declared_grid_units
+        else:
+            base_units = ceiling_units
+
+        units = min(base_units, ceiling_units) if base_units else 0
+        self._staircase_limit_units_cache = units if units else None
+        self._staircase_limit_resolved = True
+        return self._staircase_limit_units_cache
+
+    def effective_corner_slant_limit_units(self):
+        """Resolve the maximum length, in database units, to trim off
+        each leg of an ordinary 90-degree trace corner when chamfering
+        it. Tracks effective_staircase_limit_units() by default (an
+        explicit CORNER_SLANT_LIMIT_MIL overrides that). Returns None
+        if slanting is disabled.
+        """
+        if CORNER_SLANT_LIMIT_EXPLICIT:
+            units = CORNER_SLANT_LIMIT_MIL * DB_UNITS_PER_MIL if CORNER_SLANT_LIMIT_MIL else 0
+            return units if units else None
+        return self.effective_staircase_limit_units()
+
+    def _rotate_to_safe_seam(self, group_edges, ordered):
+        """For a closed loop, rotate the ordered edge list so it starts
+        right after a point where two adjacent edges can't pair up. Every
+        closed loop must have at least one such point (it can't be a
+        single unbroken diagonal all the way around, since it has to
+        turn to close) -- starting there guarantees a genuine diagonal
+        run is never artificially cut in half by an arbitrary starting
+        point."""
+        n = len(ordered)
+        for k in range(n):
+            idx_prev, _, _ = ordered[k - 1]
+            idx_cur, _, _  = ordered[k]
+            if not self._is_pairable(group_edges[idx_prev], group_edges[idx_cur]):
+                return ordered[k:] + ordered[:k]
+        return ordered  # fully-uniform loop (shouldn't happen); leave as-is
+
+    def _compress_LH_LV_chain(self, group_edges, ordered):
+        """Used only for CLOSED LOOPS (shape/outline boundaries with no
+        real electrical endpoints to preserve, e.g. a pad or via's
+        annular outline) -- open chains (real routed traces) use
+        _find_open_chain_runs() + _emit_middle_out_run() instead, which
+        additionally exploit Ultiboard's fixed H-start/V-end staircase
+        convention and check via-waypoint safety. A closed loop has no
+        such convention to lean on, so it keeps the original
+        corner-based placement.
+
+        Scan an ordered edge chain and collapse runs of alternating
+        equal-length H/V pairs (each pair forms an exact 45-degree step,
+        whatever its length) into single diagonal segments. A run only
+        ever extends by whole (H,V) pairs, so the merged result always
+        has equal total H and V displacement -- i.e. it is always an
+        exact 45-degree line.
+
+        A run must contain at least 2 qualifying pairs (4 edges) to be
+        merged. A single lone pair is deliberately left unmerged: it is
+        geometrically indistinguishable from an ordinary right-angle
+        routing corner whose two legs happen to be the same length, and
+        only a genuine multi-step staircase (which routing corners never
+        produce) gives enough confidence to safely collapse it.
+
+        Returns a list of ('orig', edge_idx) / ('diag', p_start, p_end).
+        """
+        out, n = [], len(ordered)
+
+        def step_sign(k):
+            _, p_from, p_to = ordered[k]
+            return (self._sign(p_to[0] - p_from[0]), self._sign(p_to[1] - p_from[1]))
+
+        i = 0
+        while i < n:
+            idx, _, _ = ordered[i]
+            e = group_edges[idx]
+
+            if i + 1 >= n or not self._is_pairable(e, group_edges[ordered[i + 1][0]]):
+                out.append(("orig", idx))
+                i += 1
+                continue
+
+            run_sign = (step_sign(i)[0] or step_sign(i + 1)[0],
+                        step_sign(i)[1] or step_sign(i + 1)[1])
+            run, j, pair_count = [i, i + 1], i + 1, 1
+            while j + 2 < n:
+                idxA, _, _ = ordered[j + 1]
+                idxB, _, _ = ordered[j + 2]
+                eA, eB = group_edges[idxA], group_edges[idxB]
+                if not self._is_pairable(eA, eB):
+                    break
+                if eA["orient"] == group_edges[ordered[j][0]]["orient"]:
+                    break
+                sA, sB = step_sign(j + 1), step_sign(j + 2)
+                if (sA[0] or sB[0], sA[1] or sB[1]) != run_sign:
+                    break
+                run.extend([j + 1, j + 2])
+                pair_count += 1
+                j += 2
+
+            if pair_count >= 2:
+                out.append(("diag", ordered[run[0]][1], ordered[run[-1]][2]))
+                i = run[-1] + 1
+            else:
+                # lone pair: not enough evidence of a genuine staircase,
+                # leave both edges as their original H/V segments
+                out.append(("orig", idx))
+                i += 1
+        return out
+
+    @staticmethod
+    def _diag_LT_encoding(p_start, p_end):
+        """Encode a 45-degree segment into *LT's <coord1>/<coord2>/<coord3>
+        + orientation, matching kiub.py's _handle_trace decoding.
+
+        kiub.py negates Y for orientation 1/2 (H/V) but NOT for 4/8
+        (diagonal) -- so for a diagonal segment's decoded Y to line up
+        with the Y sign convention already used by the surrounding H/V
+        geometry (i.e. final_y = -raw_y), the constant/per-point roles
+        work out swapped from the naive x+y / x-y pairing:
+          orientation 4 (NE): coord1 = x-y (constant), coord2/3 = x+y per endpoint
+          orientation 8 (SE): coord1 = x+y (constant), coord2/3 = x-y per endpoint
+
+        Asserts the input is actually a 45-degree pair rather than
+        silently falling through to orientation 8 for anything that
+        isn't orientation 4 -- a caller bug that hands this two points
+        that aren't really on a 45-degree line from each other (e.g. a
+        corner-slant chamfer built from the wrong pair of endpoints)
+        would otherwise produce a syntactically valid but geometrically
+        meaningless *LT record with no error at all.
+        """
+        x1, y1 = p_start
+        x2, y2 = p_end
+        if x1 - y1 == x2 - y2:
+            return x1 - y1, x1 + y1, x2 + y2, 4
+        assert x1 + y1 == x2 + y2, (
+            f"_diag_LT_encoding: {p_start} -> {p_end} is not a 45-degree pair "
+            f"(dx={x2-x1}, dy={y2-y1})"
+        )
+        return x1 + y1, x1 - y1, x2 - y2, 8
+
+    def _emit_orig_edge(self, e, layer):
+        """Emit a single unmerged H/V edge in *LT format."""
+        self._emit_orig_points(e, layer, e["p1"], e["p2"])
+
+    def _emit_orig_points(self, e, layer, p1, p2):
+        """Emit an H/V edge using the given endpoints, which may be a
+        shortened version of e's own original ones if an adjacent
+        diagonal run borrowed part of its length (see
+        _resolve_and_emit_open_chain)."""
+        if e["orient"] == "H":
+            coord1, c0, c1, orient = p1[1], p1[0], p2[0], 1
+        else:
+            coord1, c0, c1, orient = p1[0], p1[1], p2[1], 2
+        self.out.append(f"*LT {layer} {coord1}")
+        self.out.append(f"{c0} {c1} {e['net']} {e['tcode']} 0 {orient};")
+
+    def _resolve_and_emit_open_chain(self, group_edges, ordered, entries, layer, net, tcode):
+        """Resolve and emit a flattened list of ('orig', position) /
+        ('run', start, end) entries for one open-chain component (all
+        indices into `ordered`).
+
+        Each 'run' becomes a middle-out diagonal (see
+        _diag_LT_encoding for the placement rationale: a line through
+        the boundary unit segments' midpoints is always exactly
+        halfway between the two possible corner-based placements).
+        Rather than reconnecting each end to the run's true boundary
+        vertex with a separate perpendicular half-length stub, the
+        diagonal first tries to extend along its own slope directly
+        into the immediately adjacent connecting segment, shortening
+        that segment by half a stair-unit-length from its own far end
+        instead -- this lands exactly on the connecting segment's own
+        axis (since it runs perpendicular to the stair-unit edge it
+        replaces), so no separate stub segment is needed at all. This
+        only applies when the neighbouring entry is a plain 'orig'
+        segment (not another run), runs perpendicular to the run's
+        boundary edge, and has enough spare length to give up; a hinge
+        edge between two reversing runs can be borrowed from by both
+        sides at once, and is dropped entirely if that consumes it
+        exactly. Otherwise -- most commonly when the run's boundary
+        sits directly at a pad/via with no connecting segment at all
+        to shorten -- the original perpendicular half-stub is used as
+        a safe fallback.
+        """
+        n = len(entries)
+
+        def midpoint(p1, p2):
+            return (round((p1[0] + p2[0]) / 2), round((p1[1] + p2[1]) / 2))
+
+        remaining = {}          # orig position -> spare length left to borrow
+        borrow_from = {}        # orig position -> {shared_point: new_point}
+        run_geom = {}           # entry index -> resolved geometry (see below)
+
+        # Pass 1: resolve each run's actual diagonal endpoints.
+        for k, entry in enumerate(entries):
+            if entry[0] != "run":
+                continue
+            _, start, end = entry
+            first_idx, c_start, _ = ordered[start]
+            last_idx, _, c_end    = ordered[end]
+            first_e, last_e       = group_edges[first_idx], group_edges[last_idx]
+
+            m_start = midpoint(first_e["p1"], first_e["p2"])
+            m_end   = midpoint(last_e["p1"], last_e["p2"])
+
+            # Which 45-degree line this run's diagonal actually lies on
+            # (x-y=const or x+y=const) -- a borrowed point is only valid
+            # if it lies on this SAME line. This is what distinguishes a
+            # genuine straight connecting trace (borrowing from it stays
+            # on the line) from a direction-reversal hinge shared with a
+            # differently-sloped neighboring run (borrowing from it
+            # would not).
+            if m_start[0] - m_start[1] == m_end[0] - m_end[1]:
+                line_kind, line_val = "diff", m_start[0] - m_start[1]
+            else:
+                line_kind, line_val = "sum", m_start[0] + m_start[1]
+
+            def try_borrow(step, boundary_pos, shared_pt, ref_orient, ref_length):
+                """Walk from the run's boundary outward (step=+1 for the
+                trailing side, -1 for leading), through the entries list
+                starting at index k+step, position boundary_pos in
+                `ordered`. Any immediately-adjacent 'orig' segment whose
+                length exactly matches ref_length is fully consumed and
+                the walk continues past it -- such a segment is
+                geometrically indistinguishable from another step of the
+                very same uniform staircase (only excluded from the run
+                itself by the balance trim in _find_open_chain_runs), so
+                treating it as a genuine, differently-sized connecting
+                trace would stop the extension one step too early. The
+                walk stops and takes a final half-length borrow at the
+                first segment that doesn't exactly match (a real
+                connecting trace), or gives up (falling back to a
+                perpendicular stub) at anything else: a via-safe run
+                boundary, a branching/loop entry, a mismatched
+                orientation, or insufficient remaining length.
+                """
+                idx, cur_pt, cur_orient, cur_len = k + step, shared_pt, ref_orient, ref_length
+                pending = []  # [(position, shared_pt, new_pt, new_remaining), ...]
+                while True:
+                    if not (0 <= idx < n):
+                        return None
+                    nb = entries[idx]
+                    if nb[0] != "orig" or nb[1] != boundary_pos:
+                        return None
+                    nb_e = group_edges[ordered[nb[1]][0]]
+                    if nb_e["orient"] == cur_orient:
+                        return None
+                    far = nb_e["p2"] if nb_e["p1"] == cur_pt else nb_e["p1"]
+
+                    next_idx, next_pos = idx + step, boundary_pos + step
+                    next_is_orig = (0 <= next_idx < n and entries[next_idx][0] == "orig"
+                                    and entries[next_idx][1] == next_pos)
+                    if nb_e["length"] == cur_len and next_is_orig:
+                        # Fully consume: there's more plain, potentially
+                        # uniform-chain material beyond this segment, so
+                        # it's not the far side of a reversal hinge
+                        # meeting another run halfway (that case is
+                        # handled below instead, by the ordinary
+                        # half-length borrow, exactly as before).
+                        pending.append((nb[1], cur_pt, far, 0))
+                        cur_pt, cur_orient, cur_len = far, nb_e["orient"], nb_e["length"]
+                        idx, boundary_pos = next_idx, next_pos
+                        continue
+
+                    avail = remaining.get(nb[1], nb_e["length"])
+                    half = cur_len / 2
+                    if avail < half:
+                        return None
+                    dx, dy = self._sign(far[0] - cur_pt[0]), self._sign(far[1] - cur_pt[1])
+                    new_pt = (round(cur_pt[0] + dx * half), round(cur_pt[1] + dy * half))
+                    on_line = ((new_pt[0] - new_pt[1] == line_val) if line_kind == "diff"
+                               else (new_pt[0] + new_pt[1] == line_val))
+                    if not on_line:
+                        return None
+                    pending.append((nb[1], cur_pt, new_pt, avail - half))
+                    # The whole cascade succeeded -- commit every pending
+                    # change (including any fully-consumed intermediate
+                    # segments) now, all at once.
+                    for pos, shared, dest, new_remaining in pending:
+                        borrow_from.setdefault(pos, {})[shared] = dest
+                        remaining[pos] = new_remaining
+                    return new_pt
+
+            p_diag_start = try_borrow(-1, start - 1, c_start, first_e["orient"], first_e["length"])
+            need_start_stub = p_diag_start is None
+            if need_start_stub:
+                p_diag_start = m_start
+
+            p_diag_end = try_borrow(1, end + 1, c_end, last_e["orient"], last_e["length"])
+            need_end_stub = p_diag_end is None
+            if need_end_stub:
+                p_diag_end = m_end
+
+            run_geom[k] = (p_diag_start, p_diag_end, need_start_stub, need_end_stub,
+                           c_start, c_end, first_e, last_e)
+
+        # Pass 2: build a flat list of "leaves" -- every piece of
+        # geometry the run-borrow resolution above actually leaves
+        # behind, in order (a leaf is either an unmerged straight
+        # segment, a diagonal's stub, or a run's own diagonal) -- then
+        # look for ordinary 90-degree corners between adjacent
+        # straight leaves and chamfer them, before emitting everything.
+        leaves = self._build_leaf_list(group_edges, ordered, entries, run_geom, borrow_from)
+        self._apply_corner_slant(leaves, layer, net)
+        self._finalize_and_emit_leaves(leaves, layer, net, tcode)
+
+    def _build_leaf_list(self, group_edges, ordered, entries, run_geom, borrow_from):
+        """Flatten the run-borrow-resolved entries into an ordered list
+        of leaves, each a dict with:
+          orient:    'H' | 'V' | 'diag'
+          p1, p2:    endpoints as resolved by run-borrowing (unaffected
+                     by corner-slanting, applied later)
+          length:    leg length (H/V only; None for 'diag')
+          p1_offset / p2_offset: how much corner-slanting trims inward
+                     from each end, filled in by _apply_corner_slant()
+                     (both start at 0)
+        Consecutive leaves always share an endpoint (leaf[i]["p2"] ==
+        leaf[i+1]["p1"]) by construction -- which depends on reading
+        each 'orig' edge's endpoints from `ordered[pos]` (the
+        walk-consistent from/to direction that _order_LH_LV_component
+        already computed for it), not from the edge's own raw stored
+        p1/p2. An edge's storage order and its walk direction can
+        legitimately disagree -- _order_LH_LV_component walks whichever
+        way the chain actually connects, regardless of which end
+        happened to be recorded as p1 vs p2 -- and the rest of this
+        pass assumes leaves are given in walk-consistent order
+        throughout, exactly like Pass 1's own c_start/c_end already do
+        for run boundaries. Using the edge's raw p1/p2 instead is a
+        real, if easy to make, mistake: it silently swaps which end of
+        that edge is treated as "shared with the next leaf" and which
+        is treated as "this component's true outer end", so a
+        corner-slant offset meant for the real shared corner lands on
+        the true endpoint instead -- one that structurally should never
+        be touched at all (see _apply_corner_slant's docstring) -- while
+        the genuine corner never gets chamfered.
+        """
+        leaves = []
+        for k, entry in enumerate(entries):
+            if entry[0] == "orig":
+                pos = entry[1]
+                e = group_edges[ordered[pos][0]]
+                _, p1, p2 = ordered[pos]
+                for shared_pt, new_pt in borrow_from.get(pos, {}).items():
+                    if p1 == shared_pt:
+                        p1 = new_pt
+                    if p2 == shared_pt:
+                        p2 = new_pt
+                if p1 == p2:
+                    continue
+                leaves.append({
+                    "orient": e["orient"], "p1": p1, "p2": p2,
+                    "length": abs(p2[0] - p1[0]) + abs(p2[1] - p1[1]),
+                    "p1_offset": 0, "p2_offset": 0,
+                })
+            else:
+                (p_diag_start, p_diag_end, need_start_stub, need_end_stub,
+                 c_start, c_end, first_e, last_e) = run_geom[k]
+                if need_start_stub:
+                    leaves.append({
+                        "orient": first_e["orient"], "p1": c_start, "p2": p_diag_start,
+                        "length": (abs(p_diag_start[0] - c_start[0])
+                                   + abs(p_diag_start[1] - c_start[1])),
+                        "p1_offset": 0, "p2_offset": 0,
+                    })
+                leaves.append({
+                    "orient": "diag", "p1": p_diag_start, "p2": p_diag_end,
+                    "length": None, "p1_offset": 0, "p2_offset": 0,
+                })
+                if need_end_stub:
+                    leaves.append({
+                        "orient": last_e["orient"], "p1": p_diag_end, "p2": c_end,
+                        "length": (abs(c_end[0] - p_diag_end[0])
+                                   + abs(c_end[1] - p_diag_end[1])),
+                        "p1_offset": 0, "p2_offset": 0,
+                    })
+        return leaves
+
+    def _apply_corner_slant(self, leaves, layer, net):
+        """Find ordinary 90-degree corners between adjacent straight
+        (H/V) leaves and record how much to trim off each side.
+
+        A diagonal leaf is never a corner-slant candidate on either
+        side -- a run's own diagonal meets its stub (or a directly
+        borrowed connecting segment) at 135 degrees, not 90, and is
+        already exactly what the staircase-recovery feature intended;
+        this pass only ever looks at two adjacent H/V leaves.
+
+        Each corner's trim amount is capped to at most half of
+        *either* adjacent leg's own full length, regardless of the
+        configured limit -- for a long leg this never binds and the
+        configured limit is what actually applies; for a leg shorter
+        than twice the limit (e.g. a short "singlet" between two other
+        corners in quick succession), its own available length caps it
+        instead. See CORNER_SLANT_LIMIT_MIL's module comment for why
+        this keeps the result within the original corner's own
+        footprint regardless of which leg is doing the limiting.
+
+        For a via, "within tolerance" alone isn't quite the right test:
+        a short leg can have *both* its corners fall within a via's own
+        radius even though the via genuinely terminates a trace at
+        only one of them -- the other is just incidentally close
+        because the leg itself is short. So instead of protecting
+        every corner within a via's radius, only the single *closest*
+        candidate corner is protected per via -- and that comparison
+        includes the whole chain's own two true outer endpoints
+        alongside the internal candidates, even though neither is ever
+        itself a chamfer candidate (they're already safe by
+        construction, never touched by this scan regardless of via
+        proximity). Without that, a via whose real attachment point is
+        one of those true endpoints would still end up "claiming" and
+        protecting whatever internal candidate happens to be nearest to
+        it -- even though the via was never actually going to be
+        disconnected there at all. Only when an internal candidate is
+        genuinely the closest point overall (closer than either true
+        endpoint) does it get protected. Each via's radius is resolved
+        for *this specific layer* via _via_radius_for_layer -- not a
+        single value shared across layers, since *T0/*T1/*T2 can
+        legitimately declare different pad sizes for the same code (see
+        that method's own docstring). A corner at a pad needs no
+        equivalent check for the same true-endpoint reason: a pad can
+        only ever sit at one of those same two points.
+        """
+        limit = self.effective_corner_slant_limit_units()
+        if not limit:
+            return
+        via_points = self.via_points_by_net.get(net, ())
+
+        candidates = [
+            i for i in range(len(leaves) - 1)
+            if leaves[i]["orient"] in ("H", "V")
+            and leaves[i + 1]["orient"] in ("H", "V")
+            and leaves[i]["orient"] != leaves[i + 1]["orient"]
+        ]
+        true_endpoints = []
+        if leaves and leaves[0]["orient"] in ("H", "V"):
+            true_endpoints.append(leaves[0]["p1"])
+        if leaves and leaves[-1]["orient"] in ("H", "V"):
+            true_endpoints.append(leaves[-1]["p2"])
+
+        protected = set()
+        for vx, vy, pad_code in via_points:
+            radius = self._via_radius_for_layer(pad_code, layer)
+            if radius <= 0:
+                continue
+            radius_sq = radius * radius
+            best_i, best_dist_sq = None, None
+            for i in candidates:
+                shared = leaves[i]["p2"]  # == leaves[i+1]["p1"]
+                dist_sq = (shared[0] - vx) ** 2 + (shared[1] - vy) ** 2
+                if dist_sq <= radius_sq and (best_dist_sq is None or dist_sq < best_dist_sq):
+                    best_i, best_dist_sq = i, dist_sq
+            for ep in true_endpoints:
+                dist_sq = (ep[0] - vx) ** 2 + (ep[1] - vy) ** 2
+                if dist_sq <= radius_sq and (best_dist_sq is None or dist_sq < best_dist_sq):
+                    best_i, best_dist_sq = None, dist_sq  # a true endpoint won; nothing to protect
+            if best_i is not None:
+                protected.add(best_i)
+
+        for i in candidates:
+            if i in protected:
+                continue
+            a, b = leaves[i], leaves[i + 1]
+            # Rounded once, here -- not left as a float to be rounded
+            # independently at each end later. A half-integer slant
+            # (whenever the binding leg length is odd) would otherwise
+            # let the two ends' shifted coordinates round in different
+            # effective directions (Python's round-half-to-even depends
+            # on the parity of the specific value being rounded, which
+            # differs between the two sides), breaking the exact
+            # |dx|=|dy| the resulting chamfer diagonal depends on by a
+            # single unit. Rounding the shared slant value itself first
+            # means both ends add/subtract the same integer, which is
+            # exact.
+            slant = round(min(limit, a["length"] / 2, b["length"] / 2))
+            if slant < 1:
+                continue
+            a["p2_offset"] = slant
+            b["p1_offset"] = slant
+
+    def _finalize_and_emit_leaves(self, leaves, layer, net, tcode):
+        """Resolve each leaf's final geometry after corner-slanting and
+        emit everything: unmerged straight legs, run diagonals, and
+        newly chamfered corners.
+
+        Every H/V leaf's two ends are shifted independently by
+        whatever _apply_corner_slant recorded there, unconditionally --
+        there is deliberately no special case for a leg that ends up
+        fully consumed (both ends shifted by exactly half its own
+        length): shifting from p1 by an offset and shifting from p2 by
+        that same offset are, for integer coordinates, exact mirror
+        arithmetic (p1+d and p2-d with d=(p2-p1)/2), so they always
+        agree to the last database unit with no separate handling
+        needed. If a leg does collapse to zero length, p1==p2 falls out
+        naturally and is simply skipped during emission.
+
+        Adjacent chamfer diagonals that turn out collinear (this only
+        ever happens when a leg between them collapsed to zero length,
+        since a genuine kink can't average out to |dx|=|dy| across two
+        45-degree pieces from different diagonal families) are merged
+        into a single output diagonal using their own two outer
+        endpoints directly.
+        """
+        def shift(p_from, p_to, offset):
+            if offset <= 0:
+                return p_from
+            dx, dy = self._sign(p_to[0] - p_from[0]), self._sign(p_to[1] - p_from[1])
+            return (round(p_from[0] + dx * offset), round(p_from[1] + dy * offset))
+
+        for leaf in leaves:
+            if leaf["orient"] == "diag":
+                leaf["p1_side_point"] = leaf["p1"]
+                leaf["p2_side_point"] = leaf["p2"]
+                continue
+            leaf["p1_side_point"] = shift(leaf["p1"], leaf["p2"], leaf["p1_offset"])
+            leaf["p2_side_point"] = shift(leaf["p2"], leaf["p1"], leaf["p2_offset"])
+
+        # Build the raw output-piece list: each non-degenerate leaf's
+        # own geometry, plus a chamfer diagonal wherever a corner-slant
+        # was actually applied (i.e. wherever the two adjacent leaves'
+        # touching points no longer coincide).
+        pieces = []  # ('straight', orient, p1, p2) | ('diag', p1, p2)
+        for i, leaf in enumerate(leaves):
+            if leaf["orient"] == "diag":
+                pieces.append(("diag", leaf["p1_side_point"], leaf["p2_side_point"]))
+            elif leaf["p1_side_point"] != leaf["p2_side_point"]:
+                pieces.append(("straight", leaf["orient"],
+                               leaf["p1_side_point"], leaf["p2_side_point"]))
+
+            if i + 1 < len(leaves):
+                p_a = leaf["p2_side_point"]
+                p_b = leaves[i + 1]["p1_side_point"]
+                if p_a != p_b:
+                    pieces.append(("diag", p_a, p_b))
+
+        # Merge adjacent diagonal pieces that are collinear: check the
+        # two outer endpoints directly (no need to reference the shared
+        # middle point at all) -- |dx|=|dy| between them holds exactly
+        # when both pieces belong to the same 45-degree family, which
+        # is precisely what "collinear through a shared point" means
+        # here.
+        merged = []
+        for piece in pieces:
+            if (merged and merged[-1][0] == "diag" and piece[0] == "diag"
+                    and merged[-1][2] == piece[1]):
+                a_start, b_end = merged[-1][1], piece[2]
+                if abs(b_end[0] - a_start[0]) == abs(b_end[1] - a_start[1]):
+                    merged[-1] = ("diag", a_start, b_end)
+                    continue
+            merged.append(piece)
+
+        for piece in merged:
+            if piece[0] == "straight":
+                _, orient, p1, p2 = piece
+                if orient == "H":
+                    coord1, c0, c1, o = p1[1], p1[0], p2[0], 1
+                else:
+                    coord1, c0, c1, o = p1[0], p1[1], p2[1], 2
+                self.out.append(f"*LT {layer} {coord1}")
+                self.out.append(f"{c0} {c1} {net} {tcode} 0 {o};")
+            else:
+                _, p1, p2 = piece
+                if p1 == p2:
+                    continue
+                coord1, c0, c1, orient = self._diag_LT_encoding(p1, p2)
+                self.out.append(f"*LT {layer} {coord1}")
+                self.out.append(f"{c0} {c1} {net} {tcode} 0 {orient};")
+
+    def _find_open_chain_runs(self, group_edges, ordered):
+        """For an OPEN CHAIN (a real routed trace with two electrical
+        endpoints, not a closed loop) find every maximal run of edges
+        that alternate H/V, all share exactly the same length (a single
+        staircase is drawn at one consistent grid step), and move in
+        one consistent diagonal direction -- then trims it only if it
+        isn't already balanced.
+
+        Strict alternation means a run's H and V edge counts can only
+        ever be equal, or differ by exactly 1 (with the majority
+        orientation sitting at both ends). An equal-count run is
+        already a complete, valid 45-degree diagonal and needs no
+        trimming, even if it happens to start or end on either
+        orientation -- e.g. two diagonals meeting at a "peak" (a
+        direction reversal) produce exactly this shape, and it's
+        correct as-is. Only a genuinely unbalanced run (off by one) is
+        trimmed, by dropping one edge from whichever end carries the
+        majority orientation -- which always leaves the result
+        starting on a horizontal segment and ending on a vertical one,
+        matching Ultiboard's own fixed convention for how it draws a
+        diagonal trace as a staircase (confirmed empirically: no matter
+        which direction a diagonal is drawn, the first segment is
+        always horizontal and the last is always vertical). The
+        trimmed-off edge can never be a genuine staircase step in that
+        case -- it's either a separate connecting trace segment that
+        happens to share the same length, or the hinge of a direction
+        reversal that belongs to neither adjacent run -- and is left
+        unmerged rather than folded in.
+
+        Returns a list of ('orig', position) / ('run', start_i, end_i)
+        entries (all indices into `ordered`), covering every edge in
+        `ordered` exactly once.
+        """
+        n = len(ordered)
+
+        def step_sign(k):
+            _, p_from, p_to = ordered[k]
+            return (self._sign(p_to[0] - p_from[0]), self._sign(p_to[1] - p_from[1]))
+
+        entries = []
+        i = 0
+        while i < n:
+            j, run_sign = i, None
+            while j + 1 < n:
+                idx_a, _, _ = ordered[j]
+                idx_b, _, _ = ordered[j + 1]
+                if not self._is_pairable(group_edges[idx_a], group_edges[idx_b]):
+                    break
+                sa, sb = step_sign(j), step_sign(j + 1)
+                combined = (sa[0] or sb[0], sa[1] or sb[1])
+                if run_sign is None:
+                    run_sign = combined
+                elif combined != run_sign:
+                    break
+                j += 1
+
+            start, end = i, j
+            count_h = sum(1 for k in range(start, end + 1)
+                          if group_edges[ordered[k][0]]["orient"] == "H")
+            count_v = (end - start + 1) - count_h
+            # Strict alternation means these can only ever be equal, or
+            # differ by exactly 1 (with the majority orientation sitting
+            # at both ends). Equal counts are already a complete,
+            # correctly-balanced 45-degree run -- e.g. a run that starts
+            # and ends on the SAME orientation because it's actually two
+            # diagonals meeting at a "peak" (a direction reversal), which
+            # is itself perfectly valid and needs no trim at all. Only
+            # trim when genuinely unbalanced, and always from whichever
+            # end carries the majority orientation, so the result still
+            # starts on H and ends on V either way.
+            if count_h > count_v:
+                end -= 1
+            elif count_v > count_h:
+                start += 1
+
+            if end > start:
+                for k in range(i, start):
+                    entries.append(("orig", k))
+                entries.append(("run", start, end))
+                for k in range(end + 1, j + 1):
+                    entries.append(("orig", k))
+                if end - start >= 3:   # 4+ edges = 2+ consecutive pairs
+                    self.multi_step_run_lengths.append(
+                        group_edges[ordered[start][0]]["length"])
+            else:
+                for k in range(i, j + 1):
+                    entries.append(("orig", k))
+            i = j + 1
+        return entries
+
+    def _split_at_via_waypoints(self, group_edges, ordered, start, end, net, layer):
+        """A diagonal can never be allowed to run through a point where
+        a via for this net sits (or close enough to it -- see
+        _point_near_via's docstring for why exact coordinate matching
+        alone isn't reliable) -- it would disconnect the via. Check
+        every INTERNAL corner of the run (the two boundary vertices are
+        excluded: they get their own connecting stub segments
+        regardless, in _emit_middle_out_run) against this net's via
+        centers, and split the run there if one is found, re-trimming
+        each half the same way _find_open_chain_runs does (only if
+        genuinely unbalanced -- see that method's docstring).
+
+        Returns a list of ('orig', position) / ('run', start_i, end_i)
+        entries covering [start, end] exactly once.
+        """
+        via_points = self.via_points_by_net.get(net)
+        if not via_points:
+            return [("run", start, end)]
+
+        split_at = [k for k in range(start, end)
+                    if self._point_near_via(ordered[k][2], via_points, layer)]
+        if not split_at:
+            return [("run", start, end)]
+
+        bounds, seg_start = [], start
+        for k in split_at:
+            bounds.append((seg_start, k))
+            seg_start = k + 1
+        bounds.append((seg_start, end))
+
+        entries = []
+        for s0, e0 in bounds:
+            if s0 > e0:
+                continue
+            s, e = s0, e0
+            count_h = sum(1 for k in range(s, e + 1)
+                          if group_edges[ordered[k][0]]["orient"] == "H")
+            count_v = (e - s + 1) - count_h
+            if count_h > count_v:
+                e -= 1
+            elif count_v > count_h:
+                s += 1
+
+            if e > s:
+                for k in range(s0, s):
+                    entries.append(("orig", k))
+                entries.append(("run", s, e))
+                for k in range(e + 1, e0 + 1):
+                    entries.append(("orig", k))
+            else:
+                for k in range(s0, e0 + 1):
+                    entries.append(("orig", k))
+        return entries
+
+    def _emit_LH_LV_edges(self, edges):
+        groups = {}
+        for idx, e in enumerate(edges):
+            # Grouped by (layer, net, tcode) only -- NOT flag (the F/V
+            # fixed/variable-width marker, already dropped from every
+            # *LT record emitted below). Flag can legitimately change
+            # partway along one continuous physical trace (confirmed:
+            # a real trace whose own DDF records switch from flag 'V'
+            # to flag 'F' partway along, with no other topology change
+            # at that point at all) -- grouping by it as well would
+            # artificially cut that trace into two disconnected
+            # components right there, for no real reason, hiding a
+            # perfectly good connecting segment from the borrow-cascade
+            # on one side of the cut. Real connectivity is still
+            # determined purely by shared endpoints, via
+            # _build_LH_LV_components below, so this only removes a
+            # spurious boundary, not genuine topology.
+            key = (e["layer"], e["net"], e["tcode"])
+            groups.setdefault(key, []).append(e)
+
+        for (layer, net, tcode), group_edges in groups.items():
+            _adjacency, components = self._build_LH_LV_components(group_edges)
+
+            for comp in components:
+                ordered, is_loop = self._order_LH_LV_component(group_edges, comp)
+
+                if ordered is None:
+                    # Branching component (a junction/T): not a simple
+                    # staircase -- emit every edge unchanged, unmerged.
+                    for idx in comp:
+                        self._emit_orig_edge(group_edges[idx], layer)
+                    continue
+
+                if is_loop:
+                    # Closed shape outline: no real electrical endpoints
+                    # to preserve, so it keeps the original corner-based
+                    # placement (see _compress_LH_LV_chain).
+                    ordered = self._rotate_to_safe_seam(group_edges, ordered)
+                    for entry in self._compress_LH_LV_chain(group_edges, ordered):
+                        if entry[0] == "orig":
+                            self._emit_orig_edge(group_edges[entry[1]], layer)
+                        else:
+                            _, p_start, p_end = entry
+                            coord1, c0, c1, orient = self._diag_LT_encoding(p_start, p_end)
+                            self.out.append(f"*LT {layer} {coord1}")
+                            self.out.append(f"{c0} {c1} {net} {tcode} 0 {orient};")
+                    continue
+
+                # Open chain: a real routed trace with two endpoints.
+                # Flatten via-waypoint splits into the run-finding
+                # entries so the borrow-from-neighbour logic in
+                # _resolve_and_emit_open_chain can see every 'orig'
+                # segment's true neighbours across the whole component.
+                flat_entries = []
+                for entry in self._find_open_chain_runs(group_edges, ordered):
+                    if entry[0] == "orig":
+                        flat_entries.append(entry)
+                        continue
+                    _, s, e = entry
+                    flat_entries.extend(
+                        self._split_at_via_waypoints(group_edges, ordered, s, e, net, layer)
+                    )
+                self._resolve_and_emit_open_chain(
+                    group_edges, ordered, flat_entries, layer, net, tcode
+                )
 
     # =========================================================
     # *V
@@ -652,13 +1643,6 @@ class DDFConverter:
 
     # =========================================================
     # *X
-    # V2/V3's *X record has only 5 numeric fields, in a DIFFERENT order
-    # from V4/V5's 7-field record: "x y height LAYER ROTATION text" here,
-    # vs V4/V5's "x y height width thickness ROTATION LAYER text" --
-    # note layer/rotation are swapped. There's no width/thickness field
-    # at all (both synthesized below: width = height, thickness fixed to
-    # 100). <layer> is also offset by one from V4/V5's convention (V2/V3
-    # layer 1 = V4/V5 layer 0 = silkscreen), hence "layer - 1" below.
     def handle_X(self):
         line = self.lines[self.i].rstrip("\n")
         self.i += 1
@@ -675,22 +1659,9 @@ class DDFConverter:
         )
 
     # =========================================================
-    # Fabricate *TS and *SBOARD from scratch: NEITHER exists anywhere in
-    # the V2/V3 source. *TS (wave-solder direction) is a fixed, inert
-    # placeholder -- kiub.py never reads this field back out either way.
-    # *SBOARD's outline is a plain rectangle built directly from the
-    # header's own board width/height (handle_P), since V2/V3 has no
-    # concept of the board outline as its own named shape the way V4/V5
-    # does.
     def emit_TS_and_SBOARD(self):
         self.out.append("*TS H 0 0")
 
-        # odd()/even() apply V4/V5's own outline-stream encoding: each
-        # segment's START point must have an odd X (the marker bit for
-        # "this begins a new disconnected segment"), its END point an
-        # even X. Used here purely to make this synthetic rectangle
-        # parse correctly through kiub.py's ordinary outline-stream logic
-        # -- same convention real V4/V5 shape/board outlines use.
         def odd(x):  return x if x % 2      else x + 1
         def even(x): return x if x % 2 == 0 else x + 1
 
@@ -708,7 +1679,6 @@ class DDFConverter:
             "0 0 0 0 0 100",
             "0.000000",
             ",".join(f"{a},{b},{c},{d}" for a, b, c, d in seg) + ";",
-            # empty pads + empty arcs sections -- a board shape has neither
             ";\n;"
         ])
 
@@ -742,16 +1712,147 @@ def convert_str(source: str) -> str:
     return DDFConverter(source.splitlines(keepends=True)).convert()
 
 
+def detect_staircases(source: str) -> dict:
+    """Check whether a V2/V3 DDF file's *LH/*LV data actually contains
+    any staircase-represented diagonal traces -- intended for a GUI (or
+    other caller) to decide whether to prompt the user before running
+    (or re-running) a full conversion.
+
+    Returns a dict:
+      {
+        "found": bool,                  # see below for exactly what this checks
+        "declared_grid_mil": float | None,  # this file's own declared
+                                             # default grid step, for a
+                                             # caller to show the user and
+                                             # let them correct if they
+                                             # know Ultiboard's routing
+                                             # grid changed mid-design
+                                             # without the header
+                                             # reflecting it -- None if
+                                             # the header declares none
+        "effective_limit_mil": float,   # what will actually be used if the
+                                             # user accepts declared_grid_mil
+                                             # as-is: that value (or the
+                                             # ceiling, if none declared),
+                                             # already capped at ceiling_mil
+        "ceiling_mil": float,           # STAIRCASE_CEILING_MIL itself
+        "most_common_step_mil": float | None,   # see below -- a warning
+        "most_common_step_count": int,          # signal only, never applied
+      }
+
+    "found" runs a real conversion under the hood and checks its output
+    for any diagonal *LT record, rather than trying to shortcut the real
+    component/connectivity analysis: *LH/*LV records are stored sorted
+    by column/row coordinate, not by trace or drawing order, so a
+    genuine staircase's edges are not necessarily -- or even usually --
+    adjacent in the file; a cheaper file-order-only heuristic can't
+    reliably tell.
+
+    Two things are deliberately forced for this detection pass alone
+    (saving and restoring whatever the caller already had set, so this
+    function has no lasting side effects):
+
+    - Corner-slanting (chamfering ordinary 90-degree corners) is forced
+      off. Chamfer diagonals and staircase-merge diagonals are written
+      in the identical *LT record format, so without isolating this,
+      "found" can't actually tell "this file has genuine staircase-drawn
+      diagonals" apart from "chamfering ordinary corners happened to
+      produce some diagonals too" -- confirmed on a real design file
+      where corner-slant alone produced over a thousand diagonal
+      records while staircase-merge, in complete isolation at the exact
+      same limit, produced zero.
+
+    - The staircase limit used for detection is forced to
+      STAIRCASE_CEILING_MIL itself, independent of this file's own
+      declared_grid_mil (below). If detection instead used the file's
+      own declared grid, a genuinely wrong declared value (too small)
+      would make "found" falsely report nothing -- exactly denying the
+      one caller (the GUI's staircase dialog) that could let the user
+      correct it. Confirmed on a real file: a declared grid of 8.3 mil
+      found nothing in isolation, but the same file's genuine staircases
+      turned out to need something closer to 25 mil. Detecting at the
+      ceiling means "found" answers "could staircase-merge ever find
+      anything here, under the most generous reasonable interpretation"
+      -- separate from declared_grid_mil/effective_limit_mil, which
+      still report this file's own actual values for the dialog to show
+      and let the user correct.
+
+    "most_common_step_mil" is the statistical mode of the per-edge
+    length across every genuinely multi-step run found during this same
+    detection pass (see DDFConverter.multi_step_run_lengths) -- i.e.
+    what this file's real, unambiguous staircases actually used, as
+    opposed to declared_grid_mil, which only reflects Ultiboard's
+    default grid *setting* at whatever point the header was last
+    written. If this comes out larger than declared_grid_mil, that's a
+    concrete, file-specific sign the routing grid was likely changed
+    after these staircases were drawn -- worth surfacing to the user as
+    a warning, but deliberately never applied automatically: it's a
+    single global statistic for the whole file, and a board can
+    legitimately mix a small grid in one dense area with a larger one
+    elsewhere, where blindly raising the effective limit to match would
+    reintroduce the exact over-merging risk the ceiling exists to
+    prevent, just somewhere else on the same board.
+    """
+    global CORNER_SLANT_LIMIT_MIL, CORNER_SLANT_LIMIT_EXPLICIT
+    global STAIRCASE_LIMIT_MIL, STAIRCASE_LIMIT_EXPLICIT
+    _saved = (CORNER_SLANT_LIMIT_MIL, CORNER_SLANT_LIMIT_EXPLICIT,
+              STAIRCASE_LIMIT_MIL, STAIRCASE_LIMIT_EXPLICIT)
+    try:
+        CORNER_SLANT_LIMIT_MIL, CORNER_SLANT_LIMIT_EXPLICIT = 0, True
+        STAIRCASE_LIMIT_MIL, STAIRCASE_LIMIT_EXPLICIT = STAIRCASE_CEILING_MIL, True
+        conv = DDFConverter(source.splitlines(keepends=True))
+        output = conv.convert()
+        declared_grid_units = conv.declared_grid_units  # set during header
+                                                          # parsing, unaffected
+                                                          # by the override above
+        multi_step_lengths = conv.multi_step_run_lengths
+    finally:
+        (CORNER_SLANT_LIMIT_MIL, CORNER_SLANT_LIMIT_EXPLICIT,
+         STAIRCASE_LIMIT_MIL, STAIRCASE_LIMIT_EXPLICIT) = _saved
+
+    found = any(
+        line.rstrip().endswith((" 0 4;", " 0 8;"))
+        for line in output.splitlines()
+    )
+
+    declared_grid_mil = (declared_grid_units / DB_UNITS_PER_MIL) if declared_grid_units else None
+    effective_limit_mil = min(declared_grid_mil, STAIRCASE_CEILING_MIL) \
+                           if declared_grid_mil else STAIRCASE_CEILING_MIL
+
+    most_common_units, most_common_count = None, 0
+    if multi_step_lengths:
+        counts = {}
+        for length in multi_step_lengths:
+            counts[length] = counts.get(length, 0) + 1
+        most_common_units, most_common_count = max(counts.items(), key=lambda kv: kv[1])
+
+    return {
+        "found": found,
+        "declared_grid_mil": declared_grid_mil,
+        "effective_limit_mil": effective_limit_mil,
+        "ceiling_mil": STAIRCASE_CEILING_MIL,
+        "most_common_step_mil": (most_common_units / DB_UNITS_PER_MIL)
+                                 if most_common_units is not None else None,
+        "most_common_step_count": most_common_count,
+    }
+
+
 # =============================================================
 # Standalone CLI
 # =============================================================
 
 def _convert_file(inp: str, outp: str) -> None:
-    """Read *inp*, convert V2/V3 → V4.60, write to *outp*."""
+    """Read *inp*, convert V2/V3 → V4.60, write to *outp*.
+
+    Ultiboard requires a DDF file's very last line to be blank to open
+    it correctly, so the converted content is written with exactly one
+    trailing blank line -- not just a single newline terminating the
+    last content line, which alone doesn't create a blank line after it.
+    """
     with open(inp, "r", encoding="cp437", errors="ignore") as f:
         source = f.read()
     with open(outp, "w", encoding="cp437") as f:
-        f.write(convert_str(source) + "\n")
+        f.write(convert_str(source).rstrip() + "\n\n")
 
 
 if __name__ == "__main__":
@@ -768,7 +1869,31 @@ if __name__ == "__main__":
         default=None,
         help="Output DDF file (default: <infile>_V4.DDF).",
     )
+    _parser.add_argument(
+        "--staircase-limit",
+        type=float,
+        default=None,
+        metavar="MIL",
+        help=(
+            "Maximum length (in mil) for a single V2/V3 staircase grid "
+            "step -- see STAIRCASE_LIMIT_MIL. Default: 25, or auto-adjusted "
+            "from the file's declared default grid step if enough edges "
+            "actually share that length."
+        ),
+    )
+    _parser.add_argument(
+        "--no-staircase-merge",
+        action="store_true",
+        help="Disable staircase-to-diagonal recovery entirely (default: enabled).",
+    )
     _args = _parser.parse_args()
+
+    if _args.no_staircase_merge:
+        STAIRCASE_LIMIT_MIL = 0
+        STAIRCASE_LIMIT_EXPLICIT = True
+    elif _args.staircase_limit is not None:
+        STAIRCASE_LIMIT_MIL = _args.staircase_limit
+        STAIRCASE_LIMIT_EXPLICIT = True
 
     # Add .DDF extension if missing
     if not _args.infile.lower().endswith(".ddf"):

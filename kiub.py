@@ -2333,30 +2333,11 @@ class Converter:
 # open_ddf() – shared helper used by both the CLI block below and kiub_gui.py
 # ---------------------------------------------------------------------------
 
-def open_ddf(path: str, verbose: bool = False, args: argparse.Namespace | None = None):
-    """Open a DDF file for reading, transparently pre-converting V2/V3 to V4.
-
-    Returns an open binary file-like object that Converter accepts as *ddf*.
-    The caller is responsible for closing it (use as a context manager or
-    call .close() explicitly).
-
-    For V4/V5 files a regular binary file handle is returned.
-    For V2/V3 files the conversion is performed in memory and an io.BytesIO
-    handle is returned – no intermediate file is written to disk.
-
-    If *args* carries 'v2v3_text_width_ratio'/'v2v3_text_thickness_ratio'
-    (see FINE_TUNING_SPEC), these override kiub_v2v3's own built-in
-    defaults for this conversion; otherwise kiub_v2v3's defaults apply.
-
-    Raises SystemExit if the file is V2/V3 but kiub_v2v3.py is not found.
-    """
-    import io as _io
-
-    # ------------------------------------------------------------------
-    # Peek at the *P record to read the DDF major version number.
-    # The version line immediately follows *P and looks like "4 60" or "3 3".
-    # We only read the first 10 lines so this is effectively free.
-    # ------------------------------------------------------------------
+def _peek_ddf_version(path: str) -> int:
+    """Peek at the *P record to read the DDF major version number,
+    without opening the whole file. The version line immediately
+    follows *P and looks like "4 60" or "3 3". Only the first 5 lines
+    are read, so this is effectively free."""
     ddf_version = 4   # safe default
     with open(path, 'rb') as _f:
         for _ in range(5):
@@ -2371,22 +2352,158 @@ def open_ddf(path: str, verbose: bool = False, args: argparse.Namespace | None =
                 except (ValueError, IndexError):
                     pass
                 break
+    return ddf_version
+
+
+def ensure_trailing_blank_line(text: str) -> str:
+    """Ultiboard requires a DDF file's very last line to be blank to
+    open it correctly -- confirmed necessary for any DDF file this tool
+    writes or rewrites, not just fresh conversions. Strips whatever
+    trailing whitespace/newlines *text* already has and appends exactly
+    two newlines, guaranteeing one genuinely blank final line regardless
+    of what was there before (a single trailing newline only terminates
+    the last content line; it does not itself create a blank line after
+    it -- that needs a second one).
+    """
+    return text.rstrip() + "\n\n"
+
+
+def effective_ddf_output_path(path: str) -> "pathlib.Path":
+    """Return the path that DDF-derived output naming -- the converted
+    KiCad files, the GUI's log file, anything derived from "this DDF's
+    name" -- should actually be based on for *path*.
+
+    Normally that's just *path* itself. It differs only when *path* is a
+    V2/V3 file whose own name already ends in "_V3": open_ddf() redirects
+    that specific case, writing its converted result to the canonical
+    (un-suffixed) name instead of *path* itself (see open_ddf()'s own
+    docstring for the full rationale -- keeping KIUC's sibling-file
+    lookup pointed at one stable name across repeated re-conversions from
+    an ever-updated V2/V3 working copy). Anything that names its own
+    output after "the DDF file" needs to agree with that redirect, or
+    the KiCad output ends up misnamed even though the DDF conversion
+    itself landed in the right place -- a GUI in particular should call
+    this as soon as an input file is chosen, before deriving an output
+    filename from it, rather than only finding out about the redirect
+    after conversion has already run.
+
+    A V4/V5 file that happens to be named "..._V3.ddf" for unrelated
+    reasons is not affected -- the redirect only ever applies to a
+    genuine V2/V3 file, checked here the same way open_ddf() itself
+    checks it.
+    """
+    import pathlib as _pathlib
+    p = _pathlib.Path(path)
+    if p.stem.lower().endswith("_v3"):
+        try:
+            version = _peek_ddf_version(path)
+        except OSError:
+            return p
+        if version in (2, 3):
+            return p.with_name(f"{p.stem[:-3]}{p.suffix}")
+    return p
+
+
+def _load_kiub_v2v3_module():
+    """Dynamically import kiub_v2v3.py from alongside this file. Raises
+    SystemExit (after printing a message) if it isn't found -- matches
+    open_ddf()'s existing behaviour."""
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _v2v3_path = os.path.join(_here, "kiub_v2v3.py")
+    if not os.path.exists(_v2v3_path):
+        print(
+            "Error: kiub_v2v3.py not found.\n"
+            "Place kiub_v2v3.py in the same folder as kiub.py to convert V2/V3 files."
+        )
+        sys.exit(1)
+
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("kiub_v2v3", _v2v3_path)
+    _mod  = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+
+def check_v2v3_staircases(path: str) -> dict | None:
+    """For a V2/V3 DDF file, check whether it contains any staircase-
+    represented diagonal traces (see kiub_v2v3.detect_staircases()) --
+    intended for a GUI to decide whether to prompt the user, before
+    committing to a real conversion, for a staircase-limit override or
+    to disable staircase recovery entirely.
+
+    Returns None if the file isn't V2/V3 (nothing to prompt about) or if
+    kiub_v2v3.py can't be found/loaded; otherwise returns
+    kiub_v2v3.detect_staircases()'s own result dict.
+    """
+    if _peek_ddf_version(path) not in (2, 3):
+        return None
+    try:
+        _mod = _load_kiub_v2v3_module()
+        with open(path, 'r', encoding='CP437', errors='replace') as _src:
+            return _mod.detect_staircases(_src.read())
+    except Exception:
+        return None
+
+
+def open_ddf(path: str, verbose: bool = False, args: argparse.Namespace | None = None,
+             write_back: bool = True):
+    """Open a DDF file for reading, transparently pre-converting V2/V3 to V4.
+
+    Returns an open binary file-like object that Converter accepts as *ddf*.
+    The caller is responsible for closing it (use as a context manager or
+    call .close() explicitly).
+
+    For V4/V5 files a regular binary file handle is returned.
+    For V2/V3 files the conversion is performed in memory, and -- when
+    *write_back* is true (the default) -- the result is ALSO written back
+    to disk, so that anything expecting to find "the DDF file for this
+    project" at its canonical name (e.g. KIUC locating a sibling DDF for a
+    schematic reannotation) sees the converted result, not a stale V2/V3
+    original:
+
+      - path == "<name>.DDF": the true original is preserved alongside it
+        as "<name>_V3.DDF" (overwriting any existing backup from a
+        previous run), and the converted result is written to "<name>.DDF"
+        itself.
+      - path == "<name>_V3.DDF": *path* is itself already a preserved V2/V3
+        working copy for some canonical project (its own name already
+        carries the marker from a previous run) -- rather than nesting yet
+        another "_V3" suffix onto it every time it's re-converted, this
+        file is left untouched and the converted result is written to
+        "<name>.DDF" instead, so repeated re-conversions from an
+        ever-updated V2/V3 working copy keep landing on the one canonical
+        path everything else (KIUC included) actually looks at.
+
+    Pass write_back=False for a read-only preview/peek (e.g. a refdes
+    pre-scan) that has no business renaming or overwriting anything on
+    disk -- the conversion still happens and is still returned, just
+    without touching the filesystem beyond the read.
+
+    If *args* carries 'v2v3_text_width_ratio'/'v2v3_text_thickness_ratio'
+    (see FINE_TUNING_SPEC), these override kiub_v2v3's own built-in
+    defaults for this conversion; otherwise kiub_v2v3's defaults apply.
+    Likewise 'v2v3_staircase_limit_mil' (a number, including 0 to disable
+    staircase-to-diagonal recovery entirely) overrides kiub_v2v3's own
+    default -- the file's own declared grid step, capped at its fixed
+    ceiling (see kiub_v2v3.STAIRCASE_CEILING_MIL); if absent or None,
+    kiub_v2v3 decides for itself. 'v2v3_corner_slant_limit_mil' works the
+    same way but independently for corner-slanting -- absent or None
+    means it tracks whatever the staircase limit resolved to (the
+    default relationship), not necessarily kiub_v2v3's own module
+    default; a number (including 0 to disable corner-slanting entirely)
+    sets it independently of the staircase limit, e.g. to keep chamfering
+    ordinary corners while staircase merging is disabled, or vice versa.
+
+    Raises SystemExit if the file is V2/V3 but kiub_v2v3.py is not found.
+    """
+    import io as _io
+    import pathlib as _pathlib
+
+    ddf_version = _peek_ddf_version(path)
 
     if ddf_version in (2, 3):
         # ── V2/V3: import kiub_v2v3 and pre-convert in memory ────────────
-        _here = os.path.dirname(os.path.abspath(__file__))
-        _v2v3_path = os.path.join(_here, "kiub_v2v3.py")
-        if not os.path.exists(_v2v3_path):
-            print(
-                "Error: kiub_v2v3.py not found.\n"
-                "Place kiub_v2v3.py in the same folder as kiub.py to convert V2/V3 files."
-            )
-            sys.exit(1)
-
-        import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location("kiub_v2v3", _v2v3_path)
-        _mod  = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
+        _mod = _load_kiub_v2v3_module()
 
         # Propagate fine-tuning overrides (if any) into kiub_v2v3's own
         # module-level constants before conversion.
@@ -2395,12 +2512,62 @@ def open_ddf(path: str, verbose: bool = False, args: argparse.Namespace | None =
                 args, 'v2v3_text_width_ratio', getattr(_mod, 'TEXT_WIDTH_RATIO', 0.8))
             _mod.TEXT_THICKNESS_RATIO = getattr(
                 args, 'v2v3_text_thickness_ratio', getattr(_mod, 'TEXT_THICKNESS_RATIO', 0.1667))
+            # v2v3_staircase_limit_mil: None/absent = auto (the file's own
+            # declared grid step, capped at STAIRCASE_CEILING_MIL); a
+            # number (including 0, meaning disabled) is an explicit
+            # override -- see kiub_v2v3's own CLI flags
+            # --staircase-limit / --no-staircase-merge for the equivalent
+            # standalone behaviour. Still subject to the ceiling either way.
+            _staircase_limit = getattr(args, 'v2v3_staircase_limit_mil', None)
+            if _staircase_limit is not None:
+                _mod.STAIRCASE_LIMIT_MIL = _staircase_limit
+                _mod.STAIRCASE_LIMIT_EXPLICIT = True
+            # v2v3_corner_slant_limit_mil: None/absent = track the
+            # staircase limit above (kiub_v2v3's own default relationship);
+            # a number (including 0, meaning disabled) sets it
+            # independently -- needed whenever corner-slanting should
+            # behave differently from staircase merging in the same
+            # conversion, e.g. the GUI's staircase prompt keeping
+            # chamfering on even when the user disables staircase
+            # recovery itself.
+            _corner_slant_limit = getattr(args, 'v2v3_corner_slant_limit_mil', None)
+            if _corner_slant_limit is not None:
+                _mod.CORNER_SLANT_LIMIT_MIL = _corner_slant_limit
+                _mod.CORNER_SLANT_LIMIT_EXPLICIT = True
 
         if verbose:
             print(f"DDF version {ddf_version} detected – pre-converting via kiub_v2v3…")
 
         with open(path, 'r', encoding='CP437', errors='replace') as _src:
             _v4_str = _mod.convert_str(_src.read())
+
+        if write_back:
+            _p = _pathlib.Path(path)
+            _canonical_path = effective_ddf_output_path(path)
+            if _canonical_path != _p:
+                # Already a preserved V2/V3 working copy -- write the
+                # converted result to the canonical (un-suffixed) name
+                # instead of nesting another backup suffix onto this one,
+                # and leave this file itself untouched.
+                with open(_canonical_path, 'w', encoding='CP437', errors='replace') as _dst:
+                    _dst.write(ensure_trailing_blank_line(_v4_str))
+                print(
+                    f"Note: '{_p.name}' is a preserved V2/V3 working copy; "
+                    f"the converted result was written to "
+                    f"'{_canonical_path.name}' (this file was left unchanged)."
+                )
+            else:
+                # Preserve the original file and replace it at its own
+                # canonical path with the converted V4 content. Any
+                # existing backup from a previous run is overwritten.
+                _backup_path = _p.with_name(f"{_p.stem}_V3{_p.suffix}")
+                os.replace(_p, _backup_path)
+                with open(_p, 'w', encoding='CP437', errors='replace') as _dst:
+                    _dst.write(ensure_trailing_blank_line(_v4_str))
+                print(
+                    f"Note: original V2/V3 file preserved as '{_backup_path.name}'; "
+                    f"'{_p.name}' now holds the converted V4 result."
+                )
 
         return _io.BytesIO(_v4_str.encode('CP437'))
 
@@ -2479,10 +2646,39 @@ for _name, _default, _lo, _hi, _desc, _category in FINE_TUNING_SPEC:
     parser.add_argument(
         f'--{_name.replace("_", "-")}', type=float, default=_default, dest=_name,
         help=f'[fine-tuning/{_category}] {_desc} Default: {_default:.6g}, suggested range {_lo}-{_hi}.')
+parser.add_argument(
+    '--v2v3-staircase-limit-mil', type=float, default=None, dest='v2v3_staircase_limit_mil',
+    metavar='MIL',
+    help='DDF V2/V3 pre-conversion only: maximum length (mil) for a single staircase '
+         "grid step recovered as a diagonal trace. Default: the file's own declared "
+         'default grid step. Always capped at 25 mil regardless of this file\'s '
+         'declared grid or this override (see kiub_v2v3.STAIRCASE_CEILING_MIL).')
+parser.add_argument(
+    '--v2v3-no-staircase-merge', action='store_true',
+    help='DDF V2/V3 pre-conversion only: disable staircase-to-diagonal recovery '
+         'entirely (default: enabled).')
+parser.add_argument(
+    '--v2v3-corner-slant-limit-mil', type=float, default=None, dest='v2v3_corner_slant_limit_mil',
+    metavar='MIL',
+    help='DDF V2/V3 pre-conversion only: maximum length (mil) to trim off each leg of '
+         'an ordinary 90-degree trace corner when chamfering it. Default: tracks '
+         '--v2v3-staircase-limit-mil (or its own auto default, if that is not set '
+         'either) -- set this independently to make corner-slanting behave differently '
+         'from staircase merging in the same conversion.')
+parser.add_argument(
+    '--v2v3-no-chamfer', action='store_true',
+    help='DDF V2/V3 pre-conversion only: disable corner-slanting (chamfering ordinary '
+         '90-degree trace corners) entirely (default: enabled).')
 parser.add_argument('--yes', action='store_true',
                     help='Do not prompt when non-digit-ending reference designators are found; continue automatically.')
 
 args = parser.parse_args()
+
+if args.v2v3_no_staircase_merge:
+    args.v2v3_staircase_limit_mil = 0
+
+if args.v2v3_no_chamfer:
+    args.v2v3_corner_slant_limit_mil = 0
 
 if not args.infile.lower().endswith('.ddf'):
     args.infile += ".ddf"
