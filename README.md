@@ -37,6 +37,8 @@ Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calcul
 *   **Modern KiCad Support:** Generates native S-expression based `.kicad_pcb` and Json based `.kicad_pro` files.
 *   **DDF Support:** Handles V2.x, V3.x, V4.x (database units) and V5.x (nanometer) files.
     - V2.x and V3.x data is translated by a separate plugin (kiub_v2v3.py) before being processed by kiub.py.
+    - Diagonal traces drawn as V2.x/V3.x "staircases" (the format has no native 45° trace record) are recovered
+      as true diagonal traces, and ordinary 90° trace corners can optionally be chamfered to 45° as well.
 *   **Advanced Geometry:** Precision handling of tracks, vias, pads (SMD & THT), and complex copper zones.
 *   **Unicode Text Support:** Accurately converts Ultiboard internal fonts to KiCad-compatible text strings.
 *   **Zero Dependencies:** A lightweight implementation using standard Python libraries.
@@ -62,6 +64,24 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > [!NOTE]
 > When no file extension is specified, the code will add .DDF to the source file and/or .kicad_pcb to the destination file.
 
+> [!IMPORTANT]
+> Converting a V2/V3 DDF file also rewrites it on disk, not just the `.kicad_pcb` output:
+> - The original V2/V3 file is preserved alongside it as `<name>_V3.DDF`, and the converted V4-format result is written back to `<name>.DDF` itself -- so the canonical filename always ends up holding the current, converted result. This matters for anything that locates "the DDF file for this project" by that exact name, such as [KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter) finding a sibling DDF during schematic reference-designator reannotation.
+> - A pre-existing `<name>_V3.DDF` from an earlier run is silently overwritten.
+> - If you keep editing the design afterwards in a version of Ultiboard that still requires the V2/V3 format, do that editing in the preserved `<name>_V3.DDF` copy and re-run KIUB on *that* file each time. KIUB recognizes a `_V3`-suffixed input as an already-preserved working copy: it leaves that file untouched and writes each new result to `<name>.DDF` instead of nesting another `_V3` suffix onto it.
+> - Every DDF file KIUB writes or rewrites ends in a genuine blank line, which Ultiboard requires to open a DDF correctly.
+
+### V2/V3 pre-conversion options
+
+These only apply when converting a V2.x/V3.x DDF file; they have no effect on native V4.x/V5.x files.
+
+| Option | Description |
+| :---: | --- |
+| `--v2v3-staircase-limit-mil MIL` | Maximum length (mil) for a single staircase grid step recovered as a diagonal trace. Default: the file's own declared default grid step, always capped at a fixed 25 mil ceiling regardless of this override or the file's declared grid. |
+| `--v2v3-no-staircase-merge` | Disable staircase-to-diagonal recovery entirely (default: enabled). |
+| `--v2v3-corner-slant-limit-mil MIL` | Maximum length (mil) to trim off each leg of an ordinary 90° trace corner when chamfering it. Default: tracks `--v2v3-staircase-limit-mil` (or its own auto default, if that isn't set either). |
+| `--v2v3-no-chamfer` | Disable corner-slanting (chamfering ordinary 90° trace corners) entirely (default: enabled). |
+
 ### Examples
 
 | Command | Description |
@@ -86,11 +106,17 @@ KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
 > - Font selection.
 > - Open in KiCAD button (user selectable Kicad PCB executable path).
 > - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
-> - Adjustable geometry and clearance settings in 'Board defaults' and 'Fine-tuning'. Alter these cautiously as wrong values will result in DRC errors.
+> - A single "Conversion Settings" dialog for geometry, fallback clearance and board-default values, organized into tabs. Alter these cautiously as wrong values will result in DRC errors.
+> - Converting a V2/V3 file renames and rewrites it on disk the same way the CLI does -- see the note above.
+> - Staircase-to-diagonal recovery and chamfering: When a V2/V3 file contains diagonal traces drawn as staircases, a pop-up shows the file's declared routing grid (editable) and lets you disable staircase recovery and/or chamfering for that conversion. If no staircases are found, a smaller pop-up still offers the chamfering option, since it applies independently of staircase recovery.
 
-![Ultiboard to KiCad GUI](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI.png)
-![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Fine-tuning.png).
-![Ultiboard to KiCad Fine-tuning](assets/ultiboard-ddf-to-kicad-converter-KIUB-GUI-Board-defaults.png).
+![Ultiboard to KiCad GUI](assets/gui_main.png)
+![Conversion Settings - Board Defaults](assets/conversion_settings_board_defaults.png)
+![Conversion Settings - Geometry](assets/conversion_settings_geometry.png)
+![Conversion Settings - Fallback](assets/conversion_settings_fallback.png)
+![Staircase traces found pop-up](assets/pop_up_staircase.png)
+![Chamfer-only pop-up](assets/pop_up_chamfer.png)
+![V2/V3 working copy opened pop-up](assets/pop_up_V2V3_working_copy.png)
 
 
 ---
@@ -276,13 +302,24 @@ A full reverse-engineered description of the ASCII DDF file format is provided i
 - DDF version 2, 3, 4 and version 5 files supported.
 - Handles single layer (actually also a double layer in Ultiboard),
   double layer and multilayer boards.
+- V2/V3 diagonal traces, stored in the DDF only as a "staircase" of small
+  horizontal/vertical segments (the format has no native 45° trace record),
+  are recovered as true diagonal traces. The maximum recovered step length is
+  the file's own declared default grid step, capped at a fixed 25 mil ceiling
+  either way; editable per conversion in the GUI or via
+  --v2v3-staircase-limit-mil.
+- Ordinary 90° trace corners in a V2/V3 file can additionally be chamfered to
+  45°, independently of staircase recovery. A via is never disconnected by
+  either feature: Ultiboard can shift a via slightly off its ideal position
+  (further for a larger via pad, up to a fixed maximum), and both features
+  account for this before touching a corner near one.
 - The default font is 'KiCad Font' (NewStroke), alternatives are fonts like
   'DejaVu Sans Mono', 'Arial', 'Arial Narrow', 'Helvetica', 'Roboto' or 'ISOCPEUR'.
   The converter relies on the use of the DejaVu Sans Mono font to accurately match
   the Ultiboard characters and their size.
   ** Due to the use of a different font, small text misalignments will occur.
 - A default minimum solder mask width is specified in the Header (solder_mask_min_width 0.15).
-  Tunable in the 'Board defaults' menu.
+  Tunable in the 'Conversion Settings' dialog.
 - Shapes    Backup shapes (ending with .BAK) are ignored.
 - Polygons  Only polygon outlines are copied to the Kicad file.
             As a result, the polygons (zones in Kicad) need to be rebuilt:
