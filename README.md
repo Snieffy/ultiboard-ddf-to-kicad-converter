@@ -351,6 +351,24 @@ A full reverse-engineered description of the ASCII DDF file format is provided i
           *** Another issue (apparently a known bug in Kicad): 
               Kicad PCB view will NOT display Inner layer pads if one of the Inner layers is padless.
               However, the 3D view WILL show the Inner layer pads correctly.
+- Pad clearance
+        - Each pad clearance read from the DDF is written to each pad definition in the KiCad file.
+          In KiCad, local pad clearances have a higher priority than global and polygon clearances.
+          As a result, a polygon using a different clearance will revert to the local pad clearance.
+          If the polygon clearance also needs to apply to pads, we need to set all pad clearances = 0.
+          This value forces the pad clearances to fall back to the default clearance or polygon clearance.
+          ** How to Mass-Reset All Pad Clearances to 0
+            1. Configure the Selection Filter:
+               Look at the bottom-right corner of the PCB Editor screen and uncheck everything except Pads.
+            2. Select all pads:
+               Click inside the PCB layout area and press Ctrl-A to select every single pad across the board.
+            3. Properties Panel:
+               If the Properties Panel isn't open, enable it via View -Panels-Properties
+            4. Set Clearances to 0:
+               In the Properties Panel 'Overrides' section, change the 'Clearance Override' value to 0.
+            5. Update Zones:
+               Press B to re-pour all copper zones.    
+
 - Drillcodes    
         - Pad drill diameters less than 50um are set to -1 as these are sometimes used in Ultiboard
           to bypass SMD pad placement limitations in Ultiboard (fiducial markers):
