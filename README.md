@@ -1,5 +1,6 @@
 # Ultiboard DDF to KiCad Converter (KIUB)
 **Python:** 3.13+ | **License:** GPLv3 | **Target:** KiCad v9+
+
 ><ins>**Legal Notice**</ins>\
 [KIUB](https://github.com/Snieffy/ultiboard-ddf-to-kicad-converter) is a functional acronym for <ins>**Ki**</ins>Cad <ins>**U**</ins>lti<ins>**B**</ins>oard Converter.\
 This is an independent, open-source project and is not affiliated with, sponsored by, or endorsed by any companies sharing a similar name.\
@@ -7,7 +8,7 @@ This is an independent, open-source project and is not affiliated with, sponsore
 [KiCad](https://www.kicad.org/) is a free software suite for electronic design automation.\
 This tool is provided "as-is" for file migration purposes only.
 
-This is a high-fidelity converter designed to migrate legacy **Ultiboard DDF** (`.ddf`) files into modern **KiCad PCB** (`.kicad_pcb`) projects.\
+KIUB converts Ultiboard ASCII layout files (`.DDF`) to KiCad 9 PCB format (`.kicad_pcb`).\
 It is the PCB counterpart to [KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter),
 which converts Ulticap schematic files to KiCad schematic format.
 
@@ -17,107 +18,366 @@ which converts Ulticap schematic files to KiCad schematic format.
 
 This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
 
-### Development History
-KIUB represents a fundamental evolution and complete refactoring of earlier community-driven conversion concepts. 
-While the electronics industry has moved forward, many valuable legacy designs remain locked in Ultiboard's proprietary formats.
-KIUB provides a bridge, allowing engineers to revive and maintain these designs within the powerful, open-source KiCad ecosystem.
+This software is an original work. No Ultiboard source code, proprietary algorithms, or confidential
+materials were used or referenced in its development. The implementation is based entirely on
+independent analysis of publicly observable file format behaviour and the 1997 Ultiboard reference manual.
 
-*   **Primary Research:**\
-The core parsing logic and technical specifications are derived from the\
-**Ultiboard 32bit DOS and Windows95 - Reference Manual - Appendix A - File Formats (1997-08-15)**.
-*   **Modern Implementation:**\
-KIUB is a **clean-room-inspired rewrite** in Python 3.13. It abandons procedural limitations in favor of a modern, object-oriented architecture.
-*   **Independent Logic:**\
-Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calculations and layer mapping) have been corrected to ensure compatibility with **KiCad v9+**.
+### Development History
+
+KIUB represents a fundamental evolution and complete refactoring of earlier community-driven conversion
+concepts. While the electronics industry has moved forward, many valuable legacy designs remain locked
+in Ultiboard's proprietary formats. KIUB provides a bridge, allowing engineers to revive and maintain
+these designs within the powerful, open-source KiCad ecosystem.
+
+- **Primary Research:**\
+  The core parsing logic and technical specifications are derived from the\
+  **Ultiboard 32-bit DOS and Windows 95 — Reference Manual — Appendix A — File Formats (1997-08-15)**,\
+  supplemented by extensive empirical testing against real Ultiboard DDF files spanning V2.x through V5.x.\
+  A full reverse-engineered description of the ASCII DDF file format is provided in [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md).
+- **Modern Implementation:**\
+  KIUB is a **clean-room-inspired rewrite** in Python 3.13. It abandons procedural limitations in
+  favor of a modern, object-oriented architecture.
+- **Independent Logic:**\
+  Mathematical errors found in abandoned legacy scripts (e.g., arc midpoint calculations and layer
+  mapping) have been corrected to ensure compatibility with **KiCad v9+**.
 
 ---
 
 ## Key Features
 
-*   **Modern KiCad Support:** Generates native S-expression based `.kicad_pcb` and Json based `.kicad_pro` files.
-*   **DDF Support:** Handles V2.x, V3.x, V4.x (database units) and V5.x (nanometer) files.
-    - V2.x and V3.x data is translated by a separate plugin (kiub_v2v3.py) before being processed by kiub.py.
-    - Diagonal traces drawn as V2.x/V3.x "staircases" (the format has no native 45° trace record) are recovered
-      as true diagonal traces, and ordinary 90° trace corners can optionally be chamfered to 45° as well.
-*   **Advanced Geometry:** Precision handling of tracks, vias, pads (SMD & THT), and complex copper zones.
-*   **Unicode Text Support:** Accurately converts Ultiboard internal fonts to KiCad-compatible text strings.
-*   **Zero Dependencies:** A lightweight implementation using standard Python libraries.
-*   **Layer Intelligence:** Automatic mapping of Ultiboard stackups to KiCad's signal and technical layers.
-*   **Optional GUI:** Easy file, folder and font selection (Tkinter package needed).
+- Converts Ultiboard ASCII `.DDF` files to KiCad 9 `.kicad_pcb`, with a matching `.kicad_pro`
+  populated from the DDF's own technology data (netclasses, DRC rules, net-to-tracecode assignments)
+- Supports the full range of tested versions: V2.x, V3.x, V4.x, and V5.x
+  - V2.x/V3.x data is translated by a separate pre-processor (`kiub_v2v3.py`) before reaching the main converter
+  - Diagonal traces drawn as V2.x/V3.x "staircases" (the format has no native 45° trace record) are
+    recovered as true diagonal traces, and ordinary 90° trace corners can optionally be chamfered to
+    45° as well
+- Precision handling of tracks, vias, pads (SMD & THT), and complex copper zones
+- Accurately converts Ultiboard's internal font encoding to KiCad-compatible text. Best results come
+  from KiCad's default font, DejaVu Sans Mono, or the purpose-built **Ultiboard Stroke** font created
+  to visually match Ultiboard's own native PCB font — see "Font and Ratio" below for how to install it
+- Automatic mapping of Ultiboard layer stackups to KiCad's signal and technical layers
+- Board outline reconstruction: separates the true board edge from internal partition/divider lines
+  sharing the same outline data stream
+- GUI front-end with per-font settings memory, a tabbed Conversion Settings dialog, and interactive
+  pop-ups for V2/V3-specific choices (see "GUI" below)
+- Zero external dependencies beyond the Python standard library (tkinter for the GUI only)
 
 ![Ultiboard to KiCad conversion example using KIUB](assets/ultiboard-to-kicad-conversion-example.png)
 
 ---
 
+## Requirements
+
+- Python 3.13 or later
+- tkinter (required for the GUI only)
+- KiCad v9+
+
+The command-line converter (`kiub.py`) has no GUI dependencies at all.
+
+tkinter ships with the standard Python installer on Windows and macOS. On Linux it is usually a
+separate package:
+
+```
+sudo apt install python3-tk
+```
+
+No further installation step is required beyond the above. Download or clone the repository and run
+directly from the source folder, keeping `kiub.py`, `kiub_v2v3.py`, and `kiub_gui.py` together in the
+same directory.
+
+---
+
 ## Usage
 
-KIUB.py [-h] [-v] [-f "font"] "source" [-o "destination"]
+### GUI
 
-| Option | Description |
-| :---: | --- |
-| `-h` | Only display the help message and exit. |
-| `-v` | Print brief progress information. |
-| `-f "font"` | Replaces the default Kicad font with a user specified font during conversion.<br> Optimal results are obtained when using the DejaVu Sans Mono font (see info below).|
-| `"source"` | Path/name of the Ultiboard DDF file. |
-| `-o "destination"` | Optional - Path/name of the Kicad file.<br> When omitted, the Kicad filename will have the same name as the DDF filename.|
+Launch the converter GUI:
+
+```
+python kiub_gui.py
+```
+
+**Input DDF file**\
+Select the Ultiboard `.DDF` file to convert, either by typing/pasting the path or via **Browse…**.
+When no file extension is given, `.DDF` is added automatically.
+
+**Output**\
+Set the **Output folder** for the converted files; it follows the input file's own folder
+automatically until a folder is explicitly chosen, and reverts to following it again if cleared.
+The **Output filename** field controls the stem of the generated `.kicad_pcb` (and matching
+`.kicad_pro`); when left empty it is derived from the input DDF filename.
+
+**Font and Ratio**\
+Choose the font used for converted text in the **Font** combobox (optionally filtered to
+monospaced fonts only via **Mono only**), or click **Use KiCad Font** to reset to the KiCad
+default. The **Ratio** fields (**Height**/**Width**) next to it control `font_height_ratio`/
+`font_width_ratio` — the empirically-tuned multipliers that make converted text visually match
+Ultiboard's own rendering for the selected font. These are remembered **per font**: selecting a
+previously-used font auto-fills its last-saved ratio, entering a value outside the suggested
+1.0–1.5 range highlights the field, and the current font + ratio pair is saved only when
+**Start Conversion** is clicked. Fresh installs are pre-filled with known-good values for KiCad Font, DejaVu Sans Mono, and
+Ultiboard Stroke.
 
 > [!NOTE]
-> When no file extension is specified, the code will add .DDF to the source file and/or .kicad_pcb to the destination file.
+> Ultiboard Stroke is not a system font by default — it won't appear in the Font dropdown until
+> it's installed like any other font on your OS. The file is included in this repository as
+> `fonts/UltiboardStroke-Regular.ttf`.
+> - **Windows:** right-click the file → **Install** (or **Install for all users**).
+> - **macOS:** double-click the file → **Install Font** in Font Book.
+> - **Linux:** copy it to `~/.local/share/fonts/` (or `/usr/share/fonts/` system-wide), then run `fc-cache -f`.
+>
+> Restart KIUB's GUI afterwards so it picks up the newly installed font.
 
-> [!IMPORTANT]
-> Converting a V2/V3 DDF file also rewrites it on disk, not just the `.kicad_pcb` output:
-> - The original V2/V3 file is preserved alongside it as `<name>_V3.DDF`, and the converted V4-format result is written back to `<name>.DDF` itself -- so the canonical filename always ends up holding the current, converted result. This matters for anything that locates "the DDF file for this project" by that exact name, such as [KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter) finding a sibling DDF during schematic reference-designator reannotation.
-> - A pre-existing `<name>_V3.DDF` from an earlier run is silently overwritten.
-> - If you keep editing the design afterwards in a version of Ultiboard that still requires the V2/V3 format, do that editing in the preserved `<name>_V3.DDF` copy and re-run KIUB on *that* file each time. KIUB recognizes a `_V3`-suffixed input as an already-preserved working copy: it leaves that file untouched and writes each new result to `<name>.DDF` instead of nesting another `_V3` suffix onto it.
-> - Every DDF file KIUB writes or rewrites ends in a genuine blank line, which Ultiboard requires to open a DDF correctly.
+**Actions**
 
-### V2/V3 pre-conversion options
+| Button⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Description |
+| --- | --- |
+| **▶ Start Conversion** | Run the conversion and write the `.kicad_pcb`/`.kicad_pro` files to the selected folder. Triggers the automatic pre-conversion checks below first. |
+| **⎋ Open in KiCad** | Open the converted project directly in KiCad. Enabled only after a successful conversion. Set the path using **KiCad Path…**. |
+| **Clear Log** | Clear the on-screen conversion log. |
+| **⚙ Conversion Settings…** | Opens the Conversion Settings dialog (see below). |
+| **⚙ KiCad Path…** | Set and save the path to the KiCad executable used by Open in KiCad. |
 
-These only apply when converting a V2.x/V3.x DDF file; they have no effect on native V4.x/V5.x files.
+The conversion log (verbose or brief, depending on **Verbose output**) is shown on-screen and also
+written to a `_log.txt` file in the output directory.
+
+![Ultiboard to KiCad GUI](assets/gui_main.png)
+
+**Automatic pre-conversion checks**\
+Before Start Conversion actually runs, KIUB checks the input file in order: V2/V3 rename notice
+(first run only), reference designators, then staircase/chamfer detection for V2/V3 files. Each
+can stop the conversion if declined.
+
+**V2/V3 rename notice**\
+Converting a V2/V3 DDF file also rewrites it on disk, not just the `.kicad_pcb` output: the
+original V2/V3 file is preserved alongside it as `<name>_V3.DDF`, and the converted V4-format
+result is written back to `<name>.DDF` itself — so the canonical filename always ends up holding
+the current, converted result. This matters for anything that locates "the DDF file for this
+project" by that exact name, such as [KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter)
+finding a sibling DDF during schematic reference-designator reannotation. A pre-existing
+`<name>_V3.DDF` from an earlier run is silently overwritten. If you keep editing the design
+afterwards in a version of Ultiboard that still requires the V2/V3 format, do that editing in the
+preserved `<name>_V3.DDF` copy and re-run KIUB on *that* file each time — KIUB recognizes a
+`_V3`-suffixed input as an already-preserved working copy and leaves it untouched, writing each new
+result to `<name>.DDF` instead of nesting another `_V3` suffix onto it. Every DDF file KIUB writes
+or rewrites ends in a genuine blank line, which Ultiboard requires to open a DDF correctly. This
+notice is shown once; afterwards the rename still happens, just without the pop-up.
+
+![V2/V3 working copy opened pop-up](assets/pop_up_V2V3_working_copy.png)
+
+**Reference designators**\
+When the DDF contains reference designators that don't end in a digit (e.g. `TP`, `FID`), KiCad
+will treat these as unannotated. KIUB shows the offending list and, if a sibling schematic
+(`.SCH`/`.kicad_sch`) is found next to the DDF, recommends running
+[KIUC](https://github.com/Snieffy/ulticap-sch-to-kicad-converter)'s Refdes Reannotate tool first,
+since renaming these independently of the schematic breaks their sync. You can still continue the
+conversion as-is; KiCad's PCB editor accepts non-digit-ending references without issue if no
+schematic exists for the board.
+
+**Staircase-to-diagonal recovery and chamfering**\
+When a V2/V3 file contains diagonal traces drawn as staircases, a pop-up shows the file's declared
+routing grid (editable) and lets you disable staircase recovery and/or chamfering for that
+conversion. If no staircases are found, a smaller pop-up still offers the chamfering option, since
+it applies independently of staircase recovery.
+
+![Staircase traces found pop-up](assets/pop_up_staircase.png)
+![Chamfer-only pop-up](assets/pop_up_chamfer.png)
+
+**Conversion Settings**\
+A single tabbed dialog covering board-default values and fine-tuning constants. Alter these
+cautiously — wrong values can result in DRC errors. Changes take effect on the next conversion and
+are saved to `kiub_gui.ini`.
+
+*Board Defaults* — written into the converted `.kicad_pcb`'s `(setup)` section and/or the
+`.kicad_pro`'s design rules:
+
+| Parameter⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Default | Description |
+| --- | :---: | --- |
+| **pad_to_mask_clearance** | 0.05 | Solder mask expansion around each pad, mm. Positive values enlarge the mask opening beyond the pad edge. |
+| **solder_mask_min_width** | 0.15 | Minimum solder mask web width between adjacent mask openings, mm. Openings closer than this are merged by KiCad's plotter. |
+| **pad_to_paste_clearance** | 0.0 | Solder paste absolute clearance from the pad edge, mm (negative shrinks the paste aperture, e.g. for fine-pitch parts). |
+| **pad_to_paste_clearance_ratio** | 0.0 | Solder paste relative clearance, as a ratio of pad size (added to the absolute clearance above). |
+| **solder_mask_to_copper_clearance** | 0.0 | Minimum clearance the DRC enforces between solder mask openings and copper, mm. |
+
+![Conversion Settings - Board Defaults](assets/conversion_settings_board_defaults.png)
+
+*Geometry* — affect how converted geometry looks (text size, line widths, outline snapping). Safe
+to adjust for visual fit against KiCad's rendering; they don't affect manufacturability or DRC.
+Font Height/Width ratios have moved to the main window, next to the font selector — see "Font and
+Ratio" above.
+
+| Parameter⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Default | Description |
+| --- | :---: | --- |
+| **line_width** | 0.075 | Default width for lines, arcs, and circles (board outline, silk, etc.) wherever the DDF doesn't specify one of its own, mm. |
+| **snap_tolerance** | 0.1 | Maximum gap, mm, between adjacent board-outline endpoints before they're snapped closed into a single continuous outline. |
+| **v2v3_text_width_ratio** | 0.8 | DDF V2/V3 pre-conversion only: estimated text width = text height × this ratio (unlike V4/V5, V2/V3 DDFs don't store text width directly). |
+| **v2v3_text_thickness_ratio** | 0.1667 | DDF V2/V3 pre-conversion only: estimated text stroke thickness = text height × this ratio. |
+
+![Conversion Settings - Geometry](assets/conversion_settings_geometry.png)
+
+*Fallback* — copper clearances/widths used only where the DDF doesn't specify a value of its own.
+Alter cautiously — values set too aggressively can trigger DRC clearance violations elsewhere on
+the board.
+
+| Parameter⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Default | Description |
+| --- | :---: | --- |
+| **default_clearance** | 0.254 | Fallback copper clearance, mm, used where the DDF doesn't specify one. |
+| **default_width** | 0.254 | Fallback copper trace width, mm, used where the DDF doesn't specify one. Affects current-carrying capacity and DRC. |
+| **default_thermal_gap** | 0.254 | Fallback thermal-relief air gap (spoke-to-pad), mm, used where the DDF doesn't specify one. |
+| **default_thermal_width** | 0.254 | Fallback thermal-relief spoke width, mm, used where the DDF doesn't specify one. |
+
+![Conversion Settings - Fallback](assets/conversion_settings_fallback.png)
+
+**Settings file**\
+The GUI persists its own settings to `kiub_gui.ini`, created next to `kiub_gui.py` — but not until
+something actually needs saving; opening the GUI by itself creates nothing. Each section is added
+independently, the first time its own setting is actually used: `[kicad]` (KiCad executable path),
+`[notices]` (one-time pop-up flags), `[board_defaults]`/`[fine_tuning]` (Conversion Settings dialog
+values), and `[font_ratios]`/`[last_used]` (per-font Height/Width ratio memory — see "Font and
+Ratio" above). In practice, `[font_ratios]`/`[last_used]` are usually the first to appear, written
+together the first time **Start Conversion** is clicked — at that point all three known fonts are
+saved at once, not just whichever one was in use. This file holds local machine state (it can end
+up recording a local KiCad install path), so it isn't part of this repository — if you keep this
+folder under version control yourself, add `kiub_gui.ini` to your own `.gitignore`.
+
+---
+
+### Command Line
+
+```
+python kiub.py test.ddf
+```
+
+```
+python kiub.py "C:\source_folder\test" -o "D:\destination_folder\test_result" -f "DejaVu Sans Mono"
+```
+
+When no file extension is specified, `.DDF` is added to the input file and/or `.kicad_pcb` to the
+output file. When `-o`/`--outfile` is omitted, the output file takes the same name as the input DDF.
+
+| Option⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Description |
+|---|---|
+| `infile` | Path/name of the Ultiboard DDF file. |
+| `-o` / `--outfile` | Path/name of the KiCad file. When omitted, takes the same name as the input DDF. |
+| `-f` / `--font` | Replace the default KiCad font with a user-specified font during conversion. Optimal results are obtained using Ultiboard Stroke or DejaVu Sans Mono — see the font ratio flags below. Default: `KiCad Font`. |
+| `-v` / `--verbose` | Print progress information during conversion. |
+| `--yes` | Do not prompt when non-digit-ending reference designators are found; continue automatically. Needed for non-interactive/scripted use, since this is otherwise the CLI's one interactive prompt. |
+
+**Board defaults** — written into the converted `.kicad_pcb`'s `(setup)` section and/or the
+`.kicad_pro`'s design rules; mirrors the GUI's Board Defaults tab:
 
 | Option | Description |
-| :---: | --- |
+|---|---|
+| `--pad-to-mask-clearance` | Solder mask expansion around each pad, mm. Positive values enlarge the mask opening beyond the pad edge. Default: `0.05`, suggested range `-1.0`–`1.0`. |
+| `--solder-mask-min-width` | Minimum solder mask web width between adjacent mask openings, mm. Default: `0.15`, suggested range `0.0`–`1.0`. |
+| `--pad-to-paste-clearance` | Solder paste absolute clearance from the pad edge, mm. Default: `0.0`, suggested range `-1.0`–`1.0`. |
+| `--pad-to-paste-clearance-ratio` | Solder paste relative clearance, as a ratio of pad size. Default: `0.0`, suggested range `-1.0`–`1.0`. |
+| `--solder-mask-to-copper-clearance` | Minimum clearance the DRC enforces between solder mask openings and copper, mm. Default: `0.0`, suggested range `0.0`–`1.0`. |
+
+**Fine-tuning (geometry)** — visual fit against KiCad's rendering; doesn't affect manufacturability
+or DRC; mirrors the GUI's Geometry tab and the main window's Font/Ratio fields:
+
+| Option | Description |
+|---|---|
+| `--font-height-ratio` | KiCad text height = Ultiboard text height ÷ this ratio. Default: `1.208`, suggested range `1.0`–`1.5`. |
+| `--font-width-ratio` | KiCad text width = Ultiboard text width × this ratio. Default: `1.186`, suggested range `1.0`–`1.5`. |
+| `--line-width` | Default width for lines, arcs, and circles wherever the DDF doesn't specify one, mm. Default: `0.075`, suggested range `0.01`–`0.5`. |
+| `--snap-tolerance` | Maximum gap, mm, between adjacent board-outline endpoints before they're snapped closed. Default: `0.1`, suggested range `0.0`–`1.0`. |
+
+**Fine-tuning (fallback clearance)** — alter cautiously; mirrors the GUI's Fallback tab:
+
+| Option | Description |
+|---|---|
+| `--default-clearance` | Fallback copper clearance, mm, used where the DDF doesn't specify one. Default: `0.254`, suggested range `0.05`–`0.5`. |
+| `--default-width` | Fallback copper trace width, mm, used where the DDF doesn't specify one. Default: `0.254`, suggested range `0.05`–`0.5`. |
+| `--default-thermal-gap` | Fallback thermal-relief air gap (spoke-to-pad), mm, used where the DDF doesn't specify one. Default: `0.254`, suggested range `0.05`–`0.5`. |
+| `--default-thermal-width` | Fallback thermal-relief spoke width, mm, used where the DDF doesn't specify one. Default: `0.254`, suggested range `0.05`–`0.5`. |
+
+**V2/V3 pre-conversion options** — only apply when converting a V2.x/V3.x DDF file; no effect on
+native V4.x/V5.x files:
+
+| Option | Description |
+|---|---|
+| `--v2v3-text-width-ratio` | Estimated text width = text height × this ratio (V2/V3 DDFs don't store text width directly). Default: `0.8`, suggested range `0.3`–`1.5`. |
+| `--v2v3-text-thickness-ratio` | Estimated text stroke thickness = text height × this ratio. Default: `0.1667`, suggested range `0.05`–`0.5`. |
 | `--v2v3-staircase-limit-mil MIL` | Maximum length (mil) for a single staircase grid step recovered as a diagonal trace. Default: the file's own declared default grid step, always capped at a fixed 25 mil ceiling regardless of this override or the file's declared grid. |
 | `--v2v3-no-staircase-merge` | Disable staircase-to-diagonal recovery entirely (default: enabled). |
 | `--v2v3-corner-slant-limit-mil MIL` | Maximum length (mil) to trim off each leg of an ordinary 90° trace corner when chamfering it. Default: tracks `--v2v3-staircase-limit-mil` (or its own auto default, if that isn't set either). |
 | `--v2v3-no-chamfer` | Disable corner-slanting (chamfering ordinary 90° trace corners) entirely (default: enabled). |
 
-### Examples
-
-| Command | Description |
-| :---: | --- |
-| `KIUB "test"` | Create a file using the same name as the<br>DDF file and use the same directory as KIUB.|
-| `KIUB -f "DejaVu Sans Mono" "test"` | Create a file using the same name as the DDF file.<br>Use the same directory as KIUB.<br>Use a user defined font.|
-| `KIUB "C:\source_folder\test" -o "D:\destination_folder\test_result"` | Create a file using a different name.<br>Store the result in a different directory.<br>Use the default Kicad font.|
-
+A few things run automatically on the CLI with no flag needed: the V2/V3 rename-and-write-back
+(see "V2/V3 rename notice" above — happens silently, without the GUI's one-time pop-up), and
+staircase/chamfer recovery itself (use the flags above only to change its limits or disable it).
+The one exception is non-digit-ending reference designators, which print a warning and continue
+unless `--yes` is given to suppress the warning.
 
 > [!NOTE]
-> The DDF folder contains sample DDF files to demonstrate the conversion capabilities.\
-> 
-> Polygons need to be reconstructed once the file is opened in KiCad as only the outline and hatch settings are copied.\
-> Either open the 'Edit' menu and select 'Fill all zones' or press the 'B' key. Don't forget to save the updated design.
+> The `DDF` folder contains sample DDF files to demonstrate the conversion capabilities.
+>
+> Polygons need to be reconstructed once the file is opened in KiCad, as only the outline and hatch
+> settings are copied. Either open the 'Edit' menu and select 'Fill all zones', or press the 'B'
+> key. Don't forget to save the updated design.
 
-> [!TIP]
-> The optional GUI allows you to easily convert DDF files.\
-> Make sure all files, KIUB.py, kiub_v2v3.py  and KIUB_gui.py, are in the same directory.\
-> **Features:**
-> - Easy file selection with automatic extension name creation.
-> - Different path for the output file.
-> - Font selection.
-> - Open in KiCAD button (user selectable Kicad PCB executable path).
-> - Conversion log (verbose and non-verbose), displayed on-screen and also written to _log.txt file in the output directory.
-> - A single "Conversion Settings" dialog for geometry, fallback clearance and board-default values, organized into tabs. Alter these cautiously as wrong values will result in DRC errors.
-> - Converting a V2/V3 file renames and rewrites it on disk the same way the CLI does -- see the note above.
-> - Staircase-to-diagonal recovery and chamfering: When a V2/V3 file contains diagonal traces drawn as staircases, a pop-up shows the file's declared routing grid (editable) and lets you disable staircase recovery and/or chamfering for that conversion. If no staircases are found, a smaller pop-up still offers the chamfering option, since it applies independently of staircase recovery.
+---
 
-![Ultiboard to KiCad GUI](assets/gui_main.png)\
-![Conversion Settings - Board Defaults](assets/conversion_settings_board_defaults.png)\
-![Conversion Settings - Geometry](assets/conversion_settings_geometry.png)\
-![Conversion Settings - Fallback](assets/conversion_settings_fallback.png)\
-![Staircase traces found pop-up](assets/pop_up_staircase.png)\
-![Chamfer-only pop-up](assets/pop_up_chamfer.png)\
-![V2/V3 working copy opened pop-up](assets/pop_up_V2V3_working_copy.png)
+## Conversion Notes
 
+The software has been thoroughly tested against many different PCB designs. Even though great care
+has been taken to accurately mimic the DDF design in KiCad, small differences are still possible.
+
+> [!NOTE]
+> KIUB creates PCB files readable by KiCad v9. While the design data itself is accurate, KiCad
+> performs a one-time update of the S-expression notation the first time the converted file is
+> opened.
+
+Implementation and behaviour notes below cover how KIUB's own choices show up in the converted
+`.kicad_pcb`/`.kicad_pro`, and how to work with that output in KiCad. For the DDF file format
+itself — record layouts, rotation/layer encoding, font handling, board-outline reconstruction, and
+known errata in the original Ultiboard reference manual — see [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md).
+
+**Board setup**\
+Paper size is derived from the DDF's own board extents and set automatically, A5 up to A0. Solder
+mask minimum width defaults to `0.15` mm in the generated `.kicad_pcb` header, tunable in the GUI's
+Conversion Settings dialog (Board Defaults tab) or via `--solder-mask-min-width`.
+
+**Pads**\
+Through-hole pads become an SMD pad plus a separate through-hole pad, both sharing the same
+pin/net number. Since the real pad geometry already lives on the SMD pad, the through-hole pad's
+own size no longer needs to match it — only the drill diameter matters for connectivity — but
+KiCad still requires a through-hole pad's size to exceed its drill size, so KIUB sets it to drill
+diameter + 0.01 mm. This construction causes KiCad's DRC to report a "Padstack is questionable (SMD
+pad has no outer layer)" warning; KIUB disables that specific warning in the generated
+`.kicad_pro`. Separately, KiCad's PCB view will not display an Inner-layer pad if that layer is
+otherwise padless on that pad stack (an apparent KiCad bug) — the 3D viewer shows it correctly
+regardless. Zero-diameter drill codes (the SMD-trick sentinel) and NPTH handling for drill-only
+codes are DDF-format-level behaviour — see FILEFORMAT-DDF.md
+[§10.4](FILEFORMAT-DDF.md#104-drill-codes-and-the-smd-trick) and
+[§2](FILEFORMAT-DDF.md#2-technology-data--t-records).
+
+**Pad clearance and the mass pad-clearance reset**\
+Each pad's clearance, as read from the DDF, is written directly into that pad's own definition in
+the KiCad file. In KiCad, a pad's local clearance override always takes priority over both the
+board-wide default clearance and any zone/polygon clearance — so a copper pour using a different
+clearance than a pad's local value will still back off to that pad's local value, not the pour's
+own. If you want a polygon's own clearance to govern pad clearances as well, all pad clearances
+need to be forced back to `0` (KiCad's "fall back to default/polygon clearance" sentinel) after
+conversion:
+
+1. **Configure the Selection Filter** — bottom-right corner of the PCB Editor — and uncheck
+   everything except *Pads*.
+2. **Select all pads** — click inside the layout area, then `Ctrl+A`.
+3. **Open the Properties panel**, if not already open: *View → Panels → Properties*.
+4. **Set clearances to 0** — in the Properties panel's *Overrides* section, set *Clearance
+   Override* to `0`.
+5. **Re-pour zones** — press `B` to update all copper zones with the new clearances.
+
+**Vias**\
+Ultiboard allows non-round via shapes; KiCad's standard vias support round shapes only, so every
+via is converted to round using the DDF's own annular-ring and pad-size data per layer (F.Cu, B.Cu,
+In*.Cu) — see FILEFORMAT-DDF.md
+[§10.7](FILEFORMAT-DDF.md#107-known-errata-in-the-1997-reference-manual) for the non-round-via
+erratum this addresses.
 
 ---
 
@@ -125,267 +385,3 @@ These only apply when converting a V2.x/V3.x DDF file; they have no effect on na
 
 Contributions are welcome! If you find edge cases in specific DDF versions, please open an issue or submit a pull request.\
 As this project is GPLv3, all derivatives must remain open and free.
-
-
-
-
-## Detailed description
-### Introduction
-```
-The software has been thouroughly tested with many different PCB designs.
-Even though great care has been taken to accurately mimic the
-DDF design in Kicad, small differences still are possible.
-
-- KIUB currently creates PCB files readable by KiCad V9.
-  While the design data is accurate, KiCad will perform a one-time update
-  of the S-expression notation when the file is first opened.
-- Automatic creation of a .kicad_pro file with settings obtained from the DDF file.
-
-Erratum Ultiboard Reference Manual 
-----------------------------------
-- *TD Drill code value is NOT the radius but the diameter.
-- *C Component definition:
-     name and alias <height>, <width> definition is actually <width>, <height>.
-
-Erratum DDF file structure 
---------------------------
-- Shape line values cannot contain 2 consecutive start points (see Shape lines below).
-```
-### Ultiboard to Kicad conversion info
-Below is a a summary of the key aspects.\
-A full reverse-engineered description of the ASCII DDF file format is provided in [FILEFORMAT-DDF.md](FILEFORMAT-DDF.md)
-```
-- coordinates       V2.x, V3.x, V4.x   database units (1/1200 inch)
-                    V5.x               nanometer
-- Rotation          V2.x, V3.x         Numeric value 0..3 for top layer
-                                                     4..7 for bottom layer
-                    V4.x, V5.x         UB rotation value / 64 (degrees).
-- Text thickness    V2.x, V3.x         text height / 6
-                    V4.x, V5.x         UB thickness value x text height / 1000.
-- Round Ratio       if x padsize <= y padsize then round ratio = UB pad radius / x padsize.
-                    if x padsize >  y padsize then round ratio = UB pad radius / y padsize.
-- Shape lines       V2.x, V3.x
-                    List of x,y coordinate pairs
-                    V4.x, V5.x
-                    A new line segment starts when the x value in an xy pair is odd,
-                    then Substract 1 from this x value to obtain the real x value.
-                    If the x value in an xy pair is even, draw a line from the
-                    previous xy pair to the current xy pair.
-                    If there are two consecutive xy pairs with an odd x value
-                    (= line segment startpoint), ignore the first xy pair.
-- Fonts             The default Kicad font is based on the Newstroke font
-                    (open source, made for Kicad).
-                    When this font is used, the text width will be larger.
-                    Ultiboard's PCB character set resembles the CP437/CP850 character set.
-                    For accurate text conversion, a translation table is created,
-                    mapping the Ultiboard text codes to the same DejaVu Sans Mono font codes.
-                    NOTE:
-                    Make sure the DejaVu Sans Mono font is installed,
-                    otherwise, Kicad will revert to its default font.
-- Board outline, Board origin (X) versus the Reference point (R)
-        - The Board outline is placed on the Edge Cuts layer in Kicad.
-          Due to the limited number of available layers in Ultiboard,
-          sometimes separation lines are added to the board outline.
-          e.g.: A separation line (") in the middle of the board and a cutout.
-                        +--------------+--------+
-                        |              "        |
-                        |              "  +--+  |
-                        |          (X) "  |  |  |
-                        |              "  +--+  |
-                        |              "        |
-                       (R)-------------+--------+
-          Although correctly read, Kicad's 3D view will tell the board outline is malformed.
-          To fix this, the program moves any floating lines to the F.Fab layer.
-          Due to rounding errors in Ultiboard, the board outline sometimes isn't a closed
-          polygon. The program tries to snap all line endpoints together within a predefined
-          tolerance of 0.1mm (set by snapTolerance).
-          If the board outline still is malformed in 3D view, select all lines on the Edge Cuts layer,
-          right click on any part and select 'Shape modification' - 'Heal shapes' to close the polygon.
-        - All coordinates in the DDF file have their origin (0,0) at the Board origin (X).
-          In Ultiboard, the Board origin and reference point can be changed.
-          The default board origin is the board center position.
-          <reference point x,y> in the DDF is the user defined Reference point (R) and is an
-          offset from the board origin, only used in Ultiboard for display/edit purposes.
-- Layer lamination info for vias:
-                            Symbol  Description
-                            ------  -----------
-                               |    PCB
-                               +    Insulator between two layers
-                               (    Start layer
-                               )    End layer
-
-                        Examples (Reference manual page 7007)
-                        - 8 layer board
-                            T  1 2 3   4 5 6  B
-                            ( | + |  +  | + | )
-                          Possible vias:  only from Top to Bottom.
-
-                            T  1 2 3   4 5 6  B
-                            ((| + |) + (| + |))
-                          Possible vias:  from Top to Bottom.
-                                          from Top to inner 3.
-                                          from inner 4 to Bottom.
-
-                            T  1   2 3   4 5   6  B
-                            ((|) + (|) + (|) + (|))
-                         Possible vias:   as above.
-                                          from Top to inner 1.
-                                          from inner 2 to inner 3.
-                                          from inner 4 to inner 5.
-                                          from inner 6 to Bottom.
-
-        Layers in ULTIboard: 
-        The odd numbers are top view and the even are bottom view
-        (Reference manual page 7022)
-        example :
-            1 and 2 are layers Top and Bottom, all other layers are inner.
-                2 layers : 1   2
-                4 layers : 1   4   3   2
-                6 layers : 1   4   3   6   5   2
-                8 layers : 1   4   3   6   5   8   7   2
-                ...
-                               +---+   +---+   +---+   ...
-                            - layer pairs -
-
-- Pad layer and via layerset definitions.
-  This is a hexadecimal bitwise code and is used to map Ultiboard layers to Kicad layers.
-    For pads, multiple codes can be added together.
-    e.g.:
-      pad on layer T, 4, 9 and 15       = 0001h + 0010h + 0800h + 20000h = 20811h
-      via from layer Top to Inner 1     = 0001h + 0008h = 0009h
-      via from layer Inner 2 to Inner 3 = 0004h + 0020h = 0024h
-      via from layer Inner 4 to Inner 5 = 0010h + 0080h = 0090h
-      via from layer Inner 6 to Bottom  = 0040h + 0002h = 0042h
-
-      Ultiboard calculates the correct value based on the chosen layer lamination sequence.
-
-      Layer mapping
-      -------------
-      Ultiboard           ->  Kicad layers
-      pad and via layerset
-      Top     00000001h       (0 "F.Cu" signal)
-      Bottom  00000002h       (31 "B.Cu" signal)
-      1       00000008h       (1 "In1.Cu" signal)
-      2       00000004h       (2 "In2.Cu" signal)
-      3       00000020h       (3 "In3.Cu" signal)
-      4       00000010h       (4 "In4.Cu" signal)
-      5       00000080h       (5 "In5.Cu" signal)
-      6       00000040h       (6 "In6.Cu" signal)
-      7       00000200h       (7 "In7.Cu" signal)
-      8       00000100h       (8 "In8.Cu" signal)
-      9       00000800h       (9 "In9.Cu" signal)
-      10      00000400h       (10 "In10.Cu" signal)
-      11      00002000h       (11 "In11.Cu" signal)
-      12      00001000h       (12 "In12.Cu" signal)
-      13      00008000h       (13 "In13.Cu" signal)
-      14      00004000h       (14 "In14.Cu" signal)
-      15      00020000h       (15 "In15.Cu" signal)
-      16      00010000h       (16 "In16.Cu" signal)
-      17      00080000h       (17 "In17.Cu" signal)
-      18      00040000h       (18 "In18.Cu" signal)
-      19      00200000h       (19 "In19.Cu" signal)
-      20      00100000h       (20 "In20.Cu" signal)
-      21      00800000h       (21 "In21.Cu" signal)
-      22      00400000h       (22 "In22.Cu" signal)
-      23      02000000h       (23 "In23.Cu" signal)
-      24      01000000h       (24 "In24.Cu" signal)
-      25      08000000h       (25 "In25.Cu" signal)
-      26      04000000h       (26 "In26.Cu" signal)
-      27      20000000h       (27 "In27.Cu" signal)
-      28      10000000h       (28 "In28.Cu" signal)
-      29      80000000h       (29 "In29.Cu" signal)
-      30      40000000h       (30 "In30.Cu" signal)
-```
-### Features and limitations
-```
-- The DDF board extents are used to set the appropriate paper size (A5 up to A0 is supported).
-- DDF version 2, 3, 4 and version 5 files supported.
-- Handles single layer (actually also a double layer in Ultiboard),
-  double layer and multilayer boards.
-- V2/V3 diagonal traces, stored in the DDF only as a "staircase" of small
-  horizontal/vertical segments (the format has no native 45° trace record),
-  are recovered as true diagonal traces. The maximum recovered step length is
-  the file's own declared default grid step, capped at a fixed 25 mil ceiling
-  either way; editable per conversion in the GUI or via
-  --v2v3-staircase-limit-mil.
-- Ordinary 90° trace corners in a V2/V3 file can additionally be chamfered to
-  45°, independently of staircase recovery. A via is never disconnected by
-  either feature: Ultiboard can shift a via slightly off its ideal position
-  (further for a larger via pad, up to a fixed maximum), and both features
-  account for this before touching a corner near one.
-- The default font is 'KiCad Font' (NewStroke), alternatives are fonts like
-  'DejaVu Sans Mono', 'Arial', 'Arial Narrow', 'Helvetica', 'Roboto' or 'ISOCPEUR'.
-  The converter relies on the use of the DejaVu Sans Mono font to accurately match
-  the Ultiboard characters and their size.
-  ** Due to the use of a different font, small text misalignments will occur.
-- A default minimum solder mask width is specified in the Header (solder_mask_min_width 0.15).
-  Tunable in the 'Conversion Settings' dialog.
-- Shapes    Backup shapes (ending with .BAK) are ignored.
-- Polygons  Only polygon outlines are copied to the Kicad file.
-            As a result, the polygons (zones in Kicad) need to be rebuilt:
-             In Kicad, open the 'Edit' menu and select 'Fill all zones'
-             (or press the 'B' key after opening the file).
-            There is a limitation on the supported polygon hatch patterns.
-            Ultiboard allows 7 different hatch patterns:
-             solid, ---, |||, +++, forward slanting, backward slanting and XXX)
-            Whereas Kicad only accepts 3 hatch patterns:
-             solid, +++ and XXX
-             All other hatch patterns are set to solid fill.
-- Power planes are read and converted to solid zones (polygons).
-- Pads  - pads with zero clearance will use the default clearance NPTHclearance.
-        - A DDF can contain drillcodes without corresponding padcodes (NPTH).
-          Since Kicad expects the pad size to be at least equal to the drill size,
-          zero-sized pad sizes are set to the drill size.
-          Note: Via pad codes are NOT processed this way.
-                It is up to the user to make sure the DDF file does not contain 'padless' vias.
-        - Top, Inner and Bottom pad layers can have different pad sizes.
-          During conversion, each pad is created as a SMD pad and a single through hole pad is added,
-          all using the same pin number and net number.
-          As real pad sizes are already created as SMD pads, the through hole pad size no longer
-          has to match this (only the drill diameter matters). But, for connection purposes,
-          Kicad needs the through hole pad size to be larger than the drill size.
-          -> the through hole pad size is set to the drill diameter + 0.01mm.
-          *** This construct causes Kicad to issue a warning upon running a DRC:
-              Padstack is questionable (SMD pad has no outer layer)
-              This warning is disabled in the '.kicad_pro' file.
-          *** Another issue (apparently a known bug in Kicad): 
-              Kicad PCB view will NOT display Inner layer pads if one of the Inner layers is padless.
-              However, the 3D view WILL show the Inner layer pads correctly.
-- Pad clearance
-        - Each pad clearance read from the DDF is written to each pad definition in the KiCad file.
-          In KiCad, local pad clearances have a higher priority than global and polygon clearances.
-          As a result, a polygon using a different clearance will revert to the local pad clearance.
-          If the polygon clearance also needs to apply to pads, we need to set all pad clearances = 0.
-          This value forces the pad clearances to fall back to the default clearance or polygon clearance.
-          ** How to Mass-Reset All Pad Clearances to 0
-            1. Configure the Selection Filter:
-               Look at the bottom-right corner of the PCB Editor screen and uncheck everything except Pads.
-            2. Select all pads:
-               Click inside the PCB layout area and press Ctrl-A to select every single pad across the board.
-            3. Properties Panel:
-               If the Properties Panel isn't open, enable it via View -Panels-Properties
-            4. Set Clearances to 0:
-               In the Properties Panel 'Overrides' section, change the 'Clearance Override' value to 0.
-            5. Update Zones:
-               Press B to re-pour all copper zones.    
-
-- Drillcodes    
-        - Pad drill diameters less than 50um are set to -1 as these are sometimes used in Ultiboard
-          to bypass SMD pad placement limitations in Ultiboard (fiducial markers):
-            SMD pads on the top and bottom layer at the same location is not possible in Ultiboard.
-            Although Ultiboard will propose to place the pad one unit further (1/1200th inch or 1nm),
-            users sometimes 'trick' Ultiboard by creating a component with two pads
-            (one on the top layer and one on the bottom layer) and use a tiny drill hole that is to be
-            dismissed by the PCB manufacturor.
-            During conversion, the drill diameter will be set to -1 so this can be used in the component
-	    creation routine to place two SMD pads at the same location on the Front and Bottom layer.
-            This 'trick' also allows the program to exclude these markers from the solder paste mask.
-            NOTE: This does not apply to vias in order to allow microvias.
-- Vias  Ultiboard allows to create non-round vias.
-        These are converted to round vias using following settings:
-        - Annular rings on start, end and connected layers.
-        - Via Pad sizes for each layer (F.Cu, B.Cu In*.Cu),
-	      as defined in the DDF (Top, Bottom and Inner)
-
-```
-

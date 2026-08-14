@@ -105,18 +105,39 @@ _CONFIG_SECTION = "kicad"
 _CONFIG_KEY     = "executable"
 
 
+def _ini_cfg() -> configparser.ConfigParser:
+    """A ConfigParser for kiub_gui.ini, pre-loaded with its current
+    contents, with case-preserving option names.
+
+    Every reader/writer of this shared file must go through this helper
+    rather than instantiating configparser.ConfigParser() directly:
+    several of the functions below do a read-modify-write of the *whole*
+    file to persist just their own section, so a plain (lowercasing)
+    ConfigParser used by any one of them would silently lowercase
+    another section's option names on save -- e.g. [font_ratios]'s font
+    names -- even though that function never touches [font_ratios]
+    itself. Font family names aren't filenames, so unlike the
+    .lower() filename/extension matching used elsewhere in KIUB, there
+    is no cross-platform reason to normalise their case; it's intrinsic
+    to the font itself (its own embedded name table), not the
+    filesystem.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.optionxform = str      # type: ignore[method-assign]
+    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    return cfg
+
+
 def _load_kicad_exe() -> str:
     """Return the stored KiCad executable path, or '' if not set / invalid."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    cfg = _ini_cfg()
     path = cfg.get(_CONFIG_SECTION, _CONFIG_KEY, fallback="").strip()
     return path if path and Path(path).is_file() else ""
 
 
 def _save_kicad_exe(path: str) -> None:
     """Persist the KiCad executable path to the config file."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    cfg = _ini_cfg()      # keeps any existing keys, incl. other sections
     if not cfg.has_section(_CONFIG_SECTION):
         cfg.add_section(_CONFIG_SECTION)
     cfg.set(_CONFIG_SECTION, _CONFIG_KEY, path)
@@ -136,14 +157,12 @@ def _v3_rename_notice_shown() -> bool:
     """Whether the one-time explanation of the V2/V3 rename-and-write-back
     mechanism (see effective_ddf_output_path's docstring in kiub.py) has
     already been shown."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    cfg = _ini_cfg()
     return cfg.getboolean(_NOTICES_SECTION, _V3_RENAME_NOTICE_KEY, fallback=False)
 
 
 def _mark_v3_rename_notice_shown() -> None:
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    cfg = _ini_cfg()
     if not cfg.has_section(_NOTICES_SECTION):
         cfg.add_section(_NOTICES_SECTION)
     cfg.set(_NOTICES_SECTION, _V3_RENAME_NOTICE_KEY, "true")
@@ -164,8 +183,7 @@ def _load_board_defaults() -> dict:
     present in the file (fresh install, or a newly-added default) is simply
     left out, so the caller should overlay this onto KIUB.BOARD_DEFAULTS_SPEC's
     built-in defaults rather than assume every key is present."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    cfg = _ini_cfg()
     values = {}
     if cfg.has_section(_BOARD_DEFAULTS_SECTION):
         for name, _default, _lo, _hi, _desc, _target in KIUB.BOARD_DEFAULTS_SPEC:
@@ -179,8 +197,7 @@ def _load_board_defaults() -> dict:
 
 def _save_board_defaults(values: dict) -> None:
     """Persist board-default values to the config file."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    cfg = _ini_cfg()
     if not cfg.has_section(_BOARD_DEFAULTS_SECTION):
         cfg.add_section(_BOARD_DEFAULTS_SECTION)
     for name, value in values.items():
@@ -235,17 +252,25 @@ def _center_toplevel(win: tk.Toplevel, parent: tk.Misc) -> None:
 
 _FINE_TUNING_SECTION = "fine_tuning"
 
+# font_height_ratio/font_width_ratio are excluded from the flat
+# [fine_tuning] section below -- they persist separately, per selected
+# font, via [font_ratios]/[last_used] (see _load_font_ratios and
+# neighbours). KIUB.FINE_TUNING_SPEC still declares both as ordinary
+# tunables (CLI defaults, suggested range), just not through this path.
+_FONT_RATIO_FIELDS = ('font_height_ratio', 'font_width_ratio')
+
 
 def _load_fine_tuning() -> dict:
     """Load saved fine-tuning values from kiub_gui.ini. Any name not
     present in the file (fresh install, or a newly-added tunable) is simply
     left out, so the caller should overlay this onto KIUB.FINE_TUNING_SPEC's
     built-in defaults rather than assume every key is present."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")
+    cfg = _ini_cfg()
     values = {}
     if cfg.has_section(_FINE_TUNING_SECTION):
         for name, _default, _lo, _hi, _desc, _category in KIUB.FINE_TUNING_SPEC:
+            if name in _FONT_RATIO_FIELDS:
+                continue
             if cfg.has_option(_FINE_TUNING_SECTION, name):
                 try:
                     values[name] = cfg.getfloat(_FINE_TUNING_SECTION, name)
@@ -256,12 +281,79 @@ def _load_fine_tuning() -> dict:
 
 def _save_fine_tuning(values: dict) -> None:
     """Persist fine-tuning values to the config file."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_FILE, encoding="utf-8")      # keep any existing keys
+    cfg = _ini_cfg()
     if not cfg.has_section(_FINE_TUNING_SECTION):
         cfg.add_section(_FINE_TUNING_SECTION)
     for name, value in values.items():
+        if name in _FONT_RATIO_FIELDS:
+            continue
         cfg.set(_FINE_TUNING_SECTION, name, repr(value))
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+# ---------------------------------------------------------------------------
+# Per-font Height/Width ratio memory (kiub_gui.ini [font_ratios]/[last_used]).
+# Mirrors the fine-tuning/board-defaults sections' own load/save pattern.
+# ---------------------------------------------------------------------------
+
+_FONT_RATIOS_SECTION = "font_ratios"
+_LAST_USED_SECTION   = "last_used"
+_LAST_USED_FONT_KEY  = "font"
+
+# One-time seed for a fresh install's [font_ratios] section. This is the
+# only place a font name is ever paired with a ratio in code -- once
+# loaded, all font-selection auto-fill logic reads/writes the ini-backed
+# table above, never a name->ratio mapping baked into the GUI itself.
+# KiCad Font/DejaVu Sans Mono mirror KIUB.FINE_TUNING_SPEC's own built-in
+# font_height_ratio/font_width_ratio defaults; Ultiboard Stroke's pair
+# was derived from the font itself, built to match Ultiboard's native
+# PCB font 1:1 (see FILEFORMAT-DDF.md Section 10.5).
+_SEED_FONT_RATIOS: dict[str, tuple[float, float]] = {
+    "KiCad Font":       (1.208, 1.186),
+    "DejaVu Sans Mono": (1.208, 1.186),
+    "Ultiboard Stroke": (1.0, 1.4),
+}
+
+
+def _load_font_ratios() -> dict[str, tuple[float, float]]:
+    """Load the per-font Height/Width ratio table. A fresh install (no
+    [font_ratios] section yet) starts from _SEED_FONT_RATIOS."""
+    cfg = _ini_cfg()
+    if not cfg.has_section(_FONT_RATIOS_SECTION):
+        return dict(_SEED_FONT_RATIOS)
+    ratios: dict[str, tuple[float, float]] = {}
+    for name, raw in cfg.items(_FONT_RATIOS_SECTION):
+        try:
+            h_str, w_str = raw.split("|", 1)
+            ratios[name] = (float(h_str), float(w_str))
+        except ValueError:
+            continue        # corrupted entry; skip rather than crash
+    return ratios
+
+
+def _save_font_ratios(ratios: dict[str, tuple[float, float]]) -> None:
+    """Persist the full per-font Height/Width ratio table."""
+    cfg = _ini_cfg()
+    if not cfg.has_section(_FONT_RATIOS_SECTION):
+        cfg.add_section(_FONT_RATIOS_SECTION)
+    for name, (height, width) in ratios.items():
+        cfg.set(_FONT_RATIOS_SECTION, name, f"{height}|{width}")
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+def _load_last_used_font() -> str:
+    """Return the last-selected font name, or '' if none stored yet."""
+    cfg = _ini_cfg()
+    return cfg.get(_LAST_USED_SECTION, _LAST_USED_FONT_KEY, fallback="").strip()
+
+
+def _save_last_used_font(name: str) -> None:
+    cfg = _ini_cfg()
+    if not cfg.has_section(_LAST_USED_SECTION):
+        cfg.add_section(_LAST_USED_SECTION)
+    cfg.set(_LAST_USED_SECTION, _LAST_USED_FONT_KEY, name)
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
         cfg.write(f)
 
@@ -309,7 +401,9 @@ class _ConversionSettingsDialog(tk.Toplevel):
         'geometry':  "These affect how converted geometry looks (text size, "
                      "line widths, outline snapping). Safe to adjust for "
                      "visual fit against KiCad's rendering -- they don't "
-                     "affect manufacturability or DRC.",
+                     "affect manufacturability or DRC. Font Height/Width "
+                     "ratios have moved to the main window, next to the "
+                     "font selector -- they're remembered per font there.",
         'clearance': "These are fallback copper clearances/widths used only "
                      "where the DDF doesn't specify a value of its own. "
                      "Alter cautiously -- values set too aggressively can "
@@ -335,7 +429,8 @@ class _ConversionSettingsDialog(tk.Toplevel):
         self._board_specs = {name: (default, lo, hi, desc, target)
                              for name, default, lo, hi, desc, target in KIUB.BOARD_DEFAULTS_SPEC}
         self._fine_specs = {name: (default, lo, hi, desc, category)
-                            for name, default, lo, hi, desc, category in KIUB.FINE_TUNING_SPEC}
+                            for name, default, lo, hi, desc, category in KIUB.FINE_TUNING_SPEC
+                            if name not in _FONT_RATIO_FIELDS}
         self._vars: dict[str, tk.StringVar] = {}
         self._tab_frames: dict[str, ttk.Frame] = {}
         self._tab_field_names: dict[str, list[str]] = {}
@@ -380,6 +475,8 @@ class _ConversionSettingsDialog(tk.Toplevel):
         # ── Geometry / Fallback tabs (fine-tuning) ──────────────────────
         by_category: dict[str, list] = {}
         for entry in KIUB.FINE_TUNING_SPEC:
+            if entry[0] in _FONT_RATIO_FIELDS:
+                continue    # shown on the main window instead -- see above
             by_category.setdefault(entry[5], []).append(entry)
 
         for category in ('geometry', 'clearance'):
@@ -750,7 +847,54 @@ def _get_system_fonts(mono_only: bool = False) -> list[str]:
     )
     if mono_only:
         return [f for f in all_families if _is_monospaced(f)]
-    return all_families
+    return all_families# ---------------------------------------------------------------------------
+# Lightweight hover tooltip
+# ---------------------------------------------------------------------------
+
+class _Tooltip:
+    """A small delayed hover tooltip for a single widget. Shows after a
+    short delay on mouse-enter (avoids flicker while just passing over),
+    hides immediately on leave or click."""
+
+    _DELAY_MS = 500
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self._widget = widget
+        self._text = text
+        self._after_id: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event: Any = None) -> None:
+        self._cancel()
+        self._after_id = self._widget.after(self._DELAY_MS, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip is not None:
+            return
+        x = self._widget.winfo_rootx()
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self._tip, text=self._text, justify="left",
+            background="#ffffe0", relief="solid", borderwidth=1,
+            font=("Segoe UI", 9), wraplength=320, padx=6, pady=4,
+        ).pack()
+
+    def _hide(self, _event: Any = None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +909,14 @@ class KiubApp(tk.Tk):
     _LOG_FONT   = ("Consolas", 9)
 
     _DEFAULT_FONT = "KiCad Font"
+
+    # Fonts pinned to the top of the Font combobox (in this order), when
+    # actually present on the system -- followed by a visual separator,
+    # then every other installed font alphabetically. Purely a display
+    # convenience; selection/validity logic still works against the
+    # underlying font list, not this ordering (see _refresh_font_list).
+    _FONT_PRIORITY = ("Ultiboard Stroke", "DejaVu Sans Mono")
+    _FONT_SEPARATOR = "\u2500" * 24     # display-only, never a real font
 
     def __init__(self) -> None:
         super().__init__()
@@ -783,7 +935,18 @@ class KiubApp(tk.Tk):
         self._suppress_outdir_trace: bool = False
         self._infile_var:   tk.StringVar     = tk.StringVar()
         self._outfile_var:  tk.StringVar     = tk.StringVar()
-        self._font_var:     tk.StringVar     = tk.StringVar(value=self._DEFAULT_FONT)
+
+        # Font + per-font Height/Width ratio memory (kiub_gui.ini
+        # [font_ratios]/[last_used]). Loaded before creating the font Var
+        # so the last session's font is the combobox's initial value.
+        self._font_ratios: dict[str, tuple[float, float]] = _load_font_ratios()
+        _last_font = _load_last_used_font() or self._DEFAULT_FONT
+
+        self._font_var:         tk.StringVar = tk.StringVar(value=_last_font)
+        self._font_height_var:  tk.StringVar = tk.StringVar()
+        self._font_width_var:   tk.StringVar = tk.StringVar()
+        self._last_valid_font:  str = _last_font    # see _on_font_changed
+
         self._verbose_var:  tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
         self._mono_var:     tk.BooleanVar    = tk.BooleanVar(value=True)   # default ON
 
@@ -804,6 +967,21 @@ class KiubApp(tk.Tk):
             name: default for name, default, *_ in KIUB.FINE_TUNING_SPEC
         }
         self._fine_tuning.update(_load_fine_tuning())
+
+        # (default, lo, hi) lookup used by the main window's live ratio
+        # validation and by _build_args' range check -- built once here
+        # rather than re-scanning KIUB.FINE_TUNING_SPEC on every keystroke.
+        self._fine_specs_lookup: dict[str, tuple[float, float, float]] = {
+            name: (default, lo, hi) for name, default, lo, hi, *_ in KIUB.FINE_TUNING_SPEC
+        }
+
+        # font_height_ratio/font_width_ratio are governed by the per-font
+        # [font_ratios] table (keyed on the currently selected font), not
+        # by the flat [fine_tuning] section above -- apply the looked-up
+        # pair for the starting font now that both exist. If the starting
+        # font has no stored entry, self._fine_tuning's own default
+        # (1.208/1.186, from KIUB.FINE_TUNING_SPEC) is left as-is.
+        self._apply_font_ratio_preset(_last_font)
 
         # KiCad launcher state
         self._kicad_exe:    str = _load_kicad_exe()   # '' until confirmed valid
@@ -838,10 +1016,22 @@ class KiubApp(tk.Tk):
         self._mono_fonts = [f for f in raw_mono_fonts if not f.startswith('@')]
         self._refresh_font_list()
 
+    def _ordered_font_list(self, fonts: list[str]) -> list[str]:
+        """fonts, with any of _FONT_PRIORITY that are present moved to the
+        front (in that order), a visual separator, then the rest exactly
+        as given (already alphabetical -- see _get_system_fonts). Returns
+        fonts unchanged if none of the priority fonts are installed, so no
+        orphan separator ever appears."""
+        present = [f for f in self._FONT_PRIORITY if f in fonts]
+        if not present:
+            return fonts
+        rest = [f for f in fonts if f not in present]
+        return present + [self._FONT_SEPARATOR] + rest
+
     def _refresh_font_list(self) -> None:
         """Update the combobox to show either all fonts or only monospaced ones."""
         fonts = self._mono_fonts if self._mono_var.get() else self._all_fonts
-        self._font_combo["values"] = fonts
+        self._font_combo["values"] = self._ordered_font_list(fonts)
 
         # If the currently selected font is no longer in the filtered list,
         # clear to avoid showing a value that is not present in the dropdown.
@@ -854,13 +1044,68 @@ class KiubApp(tk.Tk):
         """Reset the font field to the KiCad default and uncheck mono filter."""
         self._mono_var.set(False)
         self._refresh_font_list()
-        self._font_var.set(self._DEFAULT_FONT)
+        self._font_var.set(self._DEFAULT_FONT)   # triggers _on_font_changed
+
+    def _apply_font_ratio_preset(self, font_name: str) -> None:
+        """Look up font_name in the per-font ratio table and, if found,
+        set both the live fine-tuning values and the main-window
+        Height/Width fields to match. If font_name has no stored entry,
+        the current values are left untouched -- per-font memory is
+        opt-in, not an auto-reset to the global default (see
+        _SEED_FONT_RATIOS)."""
+        pair = self._font_ratios.get(font_name)
+        if pair is not None:
+            self._fine_tuning['font_height_ratio'] = pair[0]
+            self._fine_tuning['font_width_ratio']  = pair[1]
+        self._font_height_var.set(str(self._fine_tuning['font_height_ratio']))
+        self._font_width_var.set(str(self._fine_tuning['font_width_ratio']))
+
+    def _on_font_changed(self, *_: Any) -> None:
+        value = self._font_var.get().strip()
+        if value == self._FONT_SEPARATOR:
+            # Display-only divider row in the dropdown -- not a real font.
+            # Revert rather than let it sit in the field or affect ratios.
+            self._font_var.set(self._last_valid_font)
+            return
+        self._last_valid_font = value
+        self._apply_font_ratio_preset(value)
+
+    _RATIO_STYLE_INVALID = "Invalid.TEntry"
+
+    def _validate_ratio_field(self, var: tk.StringVar, entry: ttk.Entry,
+                              spec_name: str) -> None:
+        """Live-validate a font ratio field against its FINE_TUNING_SPEC
+        range, colouring the entry red when the value is missing, not a
+        number, or outside the suggested range. Purely visual -- doesn't
+        block typing or clamp the value; Start Conversion still confirms
+        an out-of-range value via the same style of prompt the Conversion
+        Settings dialog uses (see _read_font_ratio_fields)."""
+        _default, lo, hi = self._fine_specs_lookup[spec_name]
+        valid = False
+        try:
+            v = float(var.get().strip())
+            valid = lo <= v <= hi
+        except ValueError:
+            valid = False
+        entry.configure(style="TEntry" if valid else self._RATIO_STYLE_INVALID)
+
+    def _ratio_tooltip_text(self, spec_name: str) -> str:
+        """Hover text for a font ratio field: its FINE_TUNING_SPEC
+        description (the calculation it feeds into) plus its suggested
+        range and default, sourced from the spec directly so the tooltip
+        can't drift out of sync with it."""
+        default, lo, hi = self._fine_specs_lookup[spec_name]
+        desc = next((d for n, _default, _lo, _hi, d, _cat in KIUB.FINE_TUNING_SPEC
+                     if n == spec_name), "")
+        return f"{desc}\n\nSuggested range: {lo}\u2013{hi} (default {default})"
 
     # -----------------------------------------------------------------------
     # UI construction
     # -----------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        ttk.Style().configure(self._RATIO_STYLE_INVALID, fieldbackground="#ffdddd")
+
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -928,6 +1173,7 @@ class KiubApp(tk.Tk):
             state="normal",        # allow free-typing as well as selection
         )
         self._font_combo.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6))
+        self._font_var.trace_add("write", self._on_font_changed)
 
         ttk.Button(
             font_inner, text="Use KiCad Font",
@@ -941,6 +1187,45 @@ class KiubApp(tk.Tk):
             variable=self._mono_var,
             command=self._refresh_font_list,
         ).grid(row=3, column=2, sticky=tk.W, padx=(6, 0), pady=(0, 8))
+
+        # ── Ratio row – row 4, columns 0-1, under the Font row ──────────────
+        # Height/Width for the selected font's font_height_ratio/
+        # font_width_ratio (formerly on the Geometry tab of the Conversion
+        # Settings dialog -- see _ConversionSettingsDialog's intro text).
+        # Auto-filled per font via _apply_font_ratio_preset/_on_font_changed;
+        # saved to kiub_gui.ini only when Start Conversion is clicked (see
+        # _persist_font_ratio), not on every keystroke or font switch.
+        ttk.Label(outer, text="Ratio:", font=self._LABEL_FONT).grid(
+            row=4, column=0, sticky=tk.W, pady=(0, 8))
+
+        ratio_inner = ttk.Frame(outer)
+        ratio_inner.grid(row=4, column=1, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(ratio_inner, text="Height:", font=self._LABEL_FONT).grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 4))
+        self._font_height_entry = ttk.Entry(
+            ratio_inner, textvariable=self._font_height_var,
+            font=self._ENTRY_FONT, width=8)
+        self._font_height_entry.grid(row=0, column=1, sticky=tk.W, padx=(0, 16))
+
+        ttk.Label(ratio_inner, text="Width:", font=self._LABEL_FONT).grid(
+            row=0, column=2, sticky=tk.W, padx=(0, 4))
+        self._font_width_entry = ttk.Entry(
+            ratio_inner, textvariable=self._font_width_var,
+            font=self._ENTRY_FONT, width=8)
+        self._font_width_entry.grid(row=0, column=3, sticky=tk.W)
+
+        self._font_height_var.trace_add("write", lambda *_: self._validate_ratio_field(
+            self._font_height_var, self._font_height_entry, 'font_height_ratio'))
+        self._font_width_var.trace_add("write", lambda *_: self._validate_ratio_field(
+            self._font_width_var, self._font_width_entry, 'font_width_ratio'))
+        # Set the initial visual state -- trace_add doesn't fire retroactively
+        # for the value each Var already held when the trace was registered.
+        self._validate_ratio_field(self._font_height_var, self._font_height_entry, 'font_height_ratio')
+        self._validate_ratio_field(self._font_width_var, self._font_width_entry, 'font_width_ratio')
+
+        _Tooltip(self._font_height_entry, self._ratio_tooltip_text('font_height_ratio'))
+        _Tooltip(self._font_width_entry, self._ratio_tooltip_text('font_width_ratio'))
 
         # ── Verbose checkbox – left-aligned in column 2, row 4 ─────────────
         ttk.Checkbutton(
@@ -1109,12 +1394,57 @@ class KiubApp(tk.Tk):
         if not outfile.lower().endswith(".kicad_pcb"):
             outfile += ".kicad_pcb"
 
+        height_ratio, width_ratio = self._read_font_ratio_fields()
+        if height_ratio is None:
+            return None
+
         return argparse.Namespace(
             infile=infile, outfile=outfile, font=font,
             verbose=self._verbose_var.get(),
             **self._board_defaults,
-            **self._fine_tuning,
+            **{**self._fine_tuning,
+               'font_height_ratio': height_ratio,
+               'font_width_ratio':  width_ratio},
         )
+
+    def _read_font_ratio_fields(self) -> tuple[float, float] | tuple[None, None]:
+        """Parse and range-check the main window's Height/Width fields --
+        same validation style as the Conversion Settings dialog's own
+        fine-tuning fields (not a number is a hard stop; out of the
+        suggested range asks for confirmation). This is the single point
+        where the live-edited fields actually take effect; the visual red/
+        white cue from _validate_ratio_field is informational only."""
+        default_h, lo_h, hi_h = self._fine_specs_lookup['font_height_ratio']
+        default_w, lo_w, hi_w = self._fine_specs_lookup['font_width_ratio']
+        try:
+            height = float(self._font_height_var.get().strip())
+            width  = float(self._font_width_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid value",
+                "Font Height and Width ratio must both be numbers.")
+            return None, None
+        for label, value, lo, hi, default in (
+            ("Height", height, lo_h, hi_h, default_h),
+            ("Width",  width,  lo_w, hi_w, default_w),
+        ):
+            if not (lo <= value <= hi):
+                ok = messagebox.askyesno("Value out of suggested range",
+                    f"Font {label} ratio = {value} is outside the suggested "
+                    f"range {lo}\u2013{hi} (default {default}).\n\nUse it anyway?")
+                if not ok:
+                    return None, None
+        return height, width
+
+    def _persist_font_ratio(self, args: argparse.Namespace) -> None:
+        """Save the current font + its Height/Width ratio to kiub_gui.ini.
+        The only point these are written to disk -- see _start_conversion.
+        Called with an already-validated args (from _build_args), so no
+        re-parsing/re-checking here."""
+        self._font_ratios[args.font] = (args.font_height_ratio, args.font_width_ratio)
+        _save_font_ratios(self._font_ratios)
+        _save_last_used_font(args.font)
+        self._fine_tuning['font_height_ratio'] = args.font_height_ratio
+        self._fine_tuning['font_width_ratio']  = args.font_width_ratio
 
     def _check_refdes_prescan(self, infile: str) -> bool:
         """Pre-scan the DDF for non-digit-ending reference designators and,
@@ -1291,6 +1621,8 @@ class KiubApp(tk.Tk):
         args = self._build_args()
         if args is None:
             return
+
+        self._persist_font_ratio(args)
 
         if not self._check_v3_naming_notice(args):
             self._status_var.set("Conversion cancelled.")

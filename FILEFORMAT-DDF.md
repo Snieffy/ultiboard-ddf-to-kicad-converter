@@ -94,6 +94,23 @@ KIUB reads and discards this line; it does not derive blind/buried-via
 legality from it, instead inferring each via's real span directly from
 that via's own layerset bitmask (Section 7).
 
+Worked examples for an 8-layer board (reference manual page 7007), Top
+layer 1, Bottom layer 8:
+
+```
+T  1 2 3   4 5 6  B
+(  | + |   +  | + )
+Vias possible: Top ↔ Bottom only.
+
+T  1 2 3    4 5 6   B
+(( | + |) + (| + |))
+Vias possible: Top ↔ Bottom, Top ↔ In3, In4 ↔ Bottom.
+
+T  1   2 3   4 5   6  B
+((|) + (|) + (|) + (|))
+Vias possible: Top ↔ Bottom, Top ↔ In1, In2 ↔ In3, In4 ↔ In5, In6 ↔ Bottom.
+```
+
 **Reference point line — `<x>, <y>`**
 The user-defined Reference Point (`R`), stored as an offset from the Board
 Origin (`X`). In Ultiboard, all other coordinates in the file are relative
@@ -595,7 +612,9 @@ see Section 10.5).
   **DejaVu Sans Mono** font specifically (the recommended substitute font,
   Section 10.5) — KiCad's own default font (NewStroke) closely matches
   Ultiboard's proportions on its own, so this correction factor mainly
-  matters when DejaVu Sans Mono is selected.
+  matters when DejaVu Sans Mono is selected. **Ultiboard Stroke** (Section
+  10.5) uses its own separate ratio (`height ÷ 1.0`) instead of this
+  default, since it was built to match Ultiboard's native glyphs directly.
 - `<width>`: DDF units; similarly scaled (`width × 1.186`).
 - `<thickness>`: multiplier, same convention as shape text
   (`thickness × height ÷ 1000`).
@@ -1295,10 +1314,20 @@ Ultiboard's PCB character set closely resembles CP437/CP850. KIUB
 extracts each `*X` text record's payload as raw bytes (before any
 higher-level line decoding) specifically to preserve high-range CP437
 byte values, then maps each byte through a fixed CP437/CP850 → Unicode
-table tuned to align with the DejaVu Sans Mono glyph set (the recommended
-substitute font for accurate visual reproduction, since KiCad's own
+table tuned to align with the DejaVu Sans Mono glyph set.
+
+Two substitute fonts give accurate visual reproduction, since KiCad's own
 default NewStroke font renders noticeably wider than Ultiboard's native
-PCB font).
+PCB font:
+
+- **Ultiboard Stroke** (`UltiboardStroke-Regular.ttf`) — built directly
+  from the original Ultiboard font's own glyph shapes, so it is the
+  closest visual match available. `font_height_ratio`/`font_width_ratio`
+  of `1.0`/`1.4` apply (Section 10 fine-tuning defaults).
+- **DejaVu Sans Mono** — a widely-installed system font whose glyph
+  widths were empirically matched to Ultiboard's own; `1.208`/`1.186`
+  apply. Requires the font to actually be installed, or KiCad silently
+  reverts to its own default font.
 
 Ultiboard text may contain an overline run delimited by `^`: the first
 `^` starts the run, a second `^` ends it; an unmatched trailing `^`
@@ -1317,6 +1346,25 @@ outline data stream as the true board edge — there is no separate
 every line/arc in the `*SBOARD` outline stream straight to `Edge.Cuts`
 therefore produces a malformed (non-closed, self-intersecting) outline
 that KiCad's DRC and 3D viewer both reject.
+
+For example, a separation line (`"`) down the middle of a board plus a
+cutout — all sharing the same `*SBOARD` outline stream as the true board
+edge:
+
+```
+                  +--------------+--------+
+                  |              "        |
+                  |              "  +--+  |
+                  |         (X)  "  |  |  |
+                  |              "  +--+  |
+                  |              "        |
+                 (R)-------------+--------+
+```
+
+`(X)` = Board Origin (all DDF coordinates are relative to this point);
+`(R)` = the user-defined Reference Point, an offset from `(X)` used only
+for on-screen display/edit purposes in Ultiboard itself (Section 1) —
+neither carries geometric meaning for the outline reconstruction below.
 
 KIUB reconstructs the true closed contour in three passes:
 
