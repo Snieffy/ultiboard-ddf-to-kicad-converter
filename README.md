@@ -1,4 +1,4 @@
-# Ultiboard DDF to KiCad Converter (KIUB)
+# Ultiboard DDF, LIB and L55 to KiCad Converter (KIUB)
 **Python:** 3.13+ | **License:** GPLv3 | **Target:** KiCad v9+
 
 ><ins>**Legal Notice**</ins>\
